@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # TaskWarrior Hook for ActivityWatch
-# Author: Emir Herrera González <emir.herrera@itam.mx>
+# Author: Emir Herrera González 
 # Inserts a TaskWarrior activity when a Task is stopped
 
 # License: GNU GPLv3
@@ -24,12 +24,9 @@ if "start" in old and ("start" not in new or "stop" in new):
     client = ActivityWatchClient("aw-watcher-warrior", testing=False)
 
     bucket_id = "{}_{}".format("aw-watcher-warrior", client.client_hostname)
-    client.create_bucket(bucket_id, event_type="active_task")
+    client.create_bucket(bucket_id, event_type="tw.task.active")
 
-    active_task_data = new.copy() #{"description":new["description"], "status":new["status"], "project": new["project"]}
-    del active_task_data["uuid"]
-    del active_task_data["entry"]
-    del active_task_data["modified"]
+    active_task_data = {"title":new["description"], "project": new["project"], "status":new["status"]}
     now = datetime.now(timezone.utc)
 
     duration = now-start
