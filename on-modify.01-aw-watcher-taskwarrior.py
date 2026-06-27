@@ -67,7 +67,9 @@ def heartbeat_daemon():
             debug_log("Bucket created/connected successfully")
             break
         except Exception as e:
-            debug_log(f"Failed to create bucket, retrying in {SERVER_RETRY_INTERVAL}s: {e}")
+            debug_log(
+                f"Failed to create bucket, retrying in {SERVER_RETRY_INTERVAL}s: {e}"
+            )
             time.sleep(SERVER_RETRY_INTERVAL)
 
     last_heartbeat_time = datetime.now(timezone.utc)
@@ -92,14 +94,14 @@ def heartbeat_daemon():
             task_desc = current_task.get("description", "unknown")
             task_tags = current_task.get("tags", [])
 
-            heartbeat_data = {
+            payload_task_data = {
                 "title": task_desc,
                 "project": current_task.get("project", "No project"),
                 "tags": task_tags,
                 "uuid": current_task.get("uuid"),
             }
             now = datetime.now(timezone.utc)
-            heartbeat_event = Event(timestamp=now, data=heartbeat_data)
+            heartbeat_event = Event(timestamp=now, data=payload_task_data)
 
             client.heartbeat(
                 bucket_id,
@@ -112,7 +114,9 @@ def heartbeat_daemon():
 
             # Check for offline gaps if task is marked as OFFLINE (before updating heartbeat time)
             if "OFFLINE" in task_tags:
-                check_and_create_offline_events(client, bucket_id, last_heartbeat_time)
+                check_and_create_offline_events(
+                    client, bucket_id, last_heartbeat_time, payload_task_data
+                )
 
             last_heartbeat_time = now
 
@@ -182,7 +186,9 @@ def start_daemon():
     )
 
 
-def check_and_create_offline_events(client, bucket_id, last_heartbeat_time):
+def check_and_create_offline_events(
+    client, bucket_id, last_heartbeat_time, payload_task_data
+):
     """
     Checks if system was offline since last heartbeat by querying the afk bucket.
     Only checks if there's been a gap in heartbeats (> 2 heartbeat intervals).
@@ -219,14 +225,18 @@ def check_and_create_offline_events(client, bucket_id, last_heartbeat_time):
                 url = f"http://localhost:5600/api/0/buckets/{bucket_id}/events"
                 payload = {
                     "timestamp": str(last_heartbeat_time),
-                    "data": {"status": "offline", "detected_via": "no_afk_data"},
+                    "data": payload_task_data,
                     "duration": int(gap_duration),
                 }
                 debug_log(f"Posting to {url}: {payload}")
                 response = post(url, json=payload, timeout=5)
-                debug_log(f"Response status: {response.status_code}, text: {response.text}")
+                debug_log(
+                    f"Response status: {response.status_code}, text: {response.text}"
+                )
                 if response.status_code == 200:
-                    debug_log(f"✓ Created offline event for complete gap: {gap_duration:.1f}s")
+                    debug_log(
+                        f"✓ Created offline event for complete gap: {gap_duration:.1f}s"
+                    )
                 else:
                     debug_log(
                         f"✗ Failed to create offline event: HTTP {response.status_code}"
