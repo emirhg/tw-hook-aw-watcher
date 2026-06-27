@@ -11,7 +11,7 @@ import os
 import sys
 import subprocess
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from socket import gethostname
 from requests import post
 
@@ -100,7 +100,15 @@ def heartbeat_daemon():
                 "tags": task_tags,
                 "uuid": current_task.get("uuid"),
             }
+            # Check for offline gaps if task is marked as OFFLINE (before updating heartbeat time)
+            if "OFFLINE" in task_tags:
+                # BUG: The caller ignores the result of the called function and therefore an event and a heartbeat are created during the same loop. Is not a big deal, but it can be considered a bug.
+                check_and_create_offline_events(
+                    client, bucket_id, last_heartbeat_time, payload_task_data
+                )
+
             now = datetime.now(timezone.utc)
+            last_heartbeat_time = now
             heartbeat_event = Event(timestamp=now, data=payload_task_data)
 
             client.heartbeat(
@@ -111,14 +119,6 @@ def heartbeat_daemon():
                 commit_interval=COMMIT_INTERVAL,
             )
             debug_log(f"Heartbeat: {task_desc} | Tags: {task_tags}")
-
-            # Check for offline gaps if task is marked as OFFLINE (before updating heartbeat time)
-            if "OFFLINE" in task_tags:
-                check_and_create_offline_events(
-                    client, bucket_id, last_heartbeat_time, payload_task_data
-                )
-
-            last_heartbeat_time = now
 
             time.sleep(HEARTBEAT_FREQUENCY)
 
@@ -187,7 +187,7 @@ def start_daemon():
 
 
 def check_and_create_offline_events(
-    client, bucket_id, last_heartbeat_time, payload_task_data
+    client, bucket_id, last_heartbeat_time: datetime, payload_task_data
 ):
     """
     Checks if system was offline since last heartbeat by querying the afk bucket.
@@ -209,13 +209,16 @@ def check_and_create_offline_events(
         # Query afk bucket to check for user inactivity
         afk_bucket_id = f"aw-watcher-afk_{gethostname()}"
         debug_log(f"Querying {afk_bucket_id} from {last_heartbeat_time} to {now}")
+        offline_event_start = last_heartbeat_time + timedelta(0, 0, 1)
 
         afk_events = client.get_events(
-            afk_bucket_id, start=last_heartbeat_time, end=now, limit=-1
+            afk_bucket_id,
+            start=(timedelta(0, HEARTBEAT_FREQUENCY, 0) + last_heartbeat_time),
+            end=now,
+            limit=-1,
         )
 
-        gap_duration = (now - last_heartbeat_time).total_seconds()
-
+        gap_duration = (now - offline_event_start).total_seconds()
         if not afk_events:
             # No afk events means system was completely off (no activity data at all)
             debug_log(
@@ -224,7 +227,7 @@ def check_and_create_offline_events(
             try:
                 url = f"http://localhost:5600/api/0/buckets/{bucket_id}/events"
                 payload = {
-                    "timestamp": str(last_heartbeat_time),
+                    "timestamp": str(offline_event_start),
                     "data": payload_task_data,
                     "duration": int(gap_duration),
                 }
