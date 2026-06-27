@@ -4,6 +4,7 @@
 # TaskWarrior hook to send heartbeats to ActivityWatch
 
 # License: GNU GPLv3
+#
 
 import json
 import os
@@ -12,6 +13,7 @@ import subprocess
 import time
 from datetime import datetime, timezone
 from socket import gethostname
+from requests import post
 
 from aw_client import ActivityWatchClient
 from aw_core.models import Event
@@ -21,18 +23,34 @@ from aw_core.models import Event
 ACTIVE_TASK_FILE = "/tmp/active-task.json"
 # File to store the PID of the daemon process
 PID_FILE = "/tmp/aw-watcher-taskwarrior.pid"
+# Debug log file
+DEBUG_LOG_FILE = "/tmp/aw-watcher-taskwarrior-debug.log"
 
 # Daemon settings
 HEARTBEAT_FREQUENCY = 3  # seconds
 PULSETIME = HEARTBEAT_FREQUENCY + 2  # Must be > HEARTBEAT_FREQUENCY
 COMMIT_INTERVAL = 15  # seconds
 SERVER_RETRY_INTERVAL = 30  # seconds
+OFFLINE_DETECTION_THRESHOLD = HEARTBEAT_FREQUENCY * 2  # seconds
+
+
+def debug_log(message):
+    """Log debug messages to a file with timestamp."""
+    try:
+        with open(DEBUG_LOG_FILE, "a") as f:
+            timestamp = datetime.now(timezone.utc).isoformat()
+            f.write(f"[{timestamp}] {message}\n")
+            f.flush()
+    except Exception:
+        pass
 
 
 def heartbeat_daemon():
     """
     This function runs as a background daemon, sending heartbeats for the active task.
     """
+    debug_log("=== Daemon started ===")
+
     # Write PID to file to prevent multiple instances
     with open(PID_FILE, "w") as f:
         f.write(str(os.getpid()))
@@ -40,14 +58,19 @@ def heartbeat_daemon():
     # Connect to ActivityWatch server
     client = ActivityWatchClient("aw-watcher-taskwarrior", testing=False)
     bucket_id = f"aw-watcher-taskwarrior_{gethostname()}"
+    debug_log(f"Connecting to bucket: {bucket_id}")
 
     # Loop to ensure bucket exists, retry if aw-server is not available
     while True:
         try:
             client.create_bucket(bucket_id, event_type="task-activity")
+            debug_log("Bucket created/connected successfully")
             break
-        except Exception:
+        except Exception as e:
+            debug_log(f"Failed to create bucket, retrying in {SERVER_RETRY_INTERVAL}s: {e}")
             time.sleep(SERVER_RETRY_INTERVAL)
+
+    last_heartbeat_time = datetime.now(timezone.utc)
 
     with client:
         while os.path.exists(ACTIVE_TASK_FILE):
@@ -66,11 +89,13 @@ def heartbeat_daemon():
 
             # Get the last task from the LIFO queue (most recently started)
             current_task = active_tasks[-1]
+            task_desc = current_task.get("description", "unknown")
+            task_tags = current_task.get("tags", [])
 
             heartbeat_data = {
-                "title": current_task.get("description", ""),
+                "title": task_desc,
                 "project": current_task.get("project", "No project"),
-                "tags": current_task.get("tags", []),
+                "tags": task_tags,
                 "uuid": current_task.get("uuid"),
             }
             now = datetime.now(timezone.utc)
@@ -83,6 +108,13 @@ def heartbeat_daemon():
                 queued=True,
                 commit_interval=COMMIT_INTERVAL,
             )
+            debug_log(f"Heartbeat: {task_desc} | Tags: {task_tags}")
+
+            # Check for offline gaps if task is marked as OFFLINE (before updating heartbeat time)
+            if "OFFLINE" in task_tags:
+                check_and_create_offline_events(client, bucket_id, last_heartbeat_time)
+
+            last_heartbeat_time = now
 
             time.sleep(HEARTBEAT_FREQUENCY)
 
@@ -148,6 +180,70 @@ def start_daemon():
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+
+
+def check_and_create_offline_events(client, bucket_id, last_heartbeat_time):
+    """
+    Checks if system was offline since last heartbeat by querying the afk bucket.
+    Only checks if there's been a gap in heartbeats (> 2 heartbeat intervals).
+    Creates offline events for gaps where there was no user activity.
+    """
+    try:
+        now = datetime.now(timezone.utc)
+        time_since_heartbeat = (now - last_heartbeat_time).total_seconds()
+
+        # Only check if heartbeats have actually stopped (gap > threshold)
+        if time_since_heartbeat <= OFFLINE_DETECTION_THRESHOLD:
+            return
+
+        debug_log(
+            f"Checking offline gaps: {time_since_heartbeat:.1f}s since last heartbeat"
+        )
+
+        # Query afk bucket to check for user inactivity
+        afk_bucket_id = f"aw-watcher-afk_{gethostname()}"
+        debug_log(f"Querying {afk_bucket_id} from {last_heartbeat_time} to {now}")
+
+        afk_events = client.get_events(
+            afk_bucket_id, start=last_heartbeat_time, end=now, limit=-1
+        )
+
+        gap_duration = (now - last_heartbeat_time).total_seconds()
+
+        if not afk_events:
+            # No afk events means system was completely off (no activity data at all)
+            debug_log(
+                f"No afk events found - system was offline for entire gap ({gap_duration:.1f}s)"
+            )
+            try:
+                url = f"http://localhost:5600/api/0/buckets/{bucket_id}/events"
+                payload = {
+                    "timestamp": str(last_heartbeat_time),
+                    "data": {"status": "offline", "detected_via": "no_afk_data"},
+                    "duration": int(gap_duration),
+                }
+                debug_log(f"Posting to {url}: {payload}")
+                response = post(url, json=payload, timeout=5)
+                debug_log(f"Response status: {response.status_code}, text: {response.text}")
+                if response.status_code == 200:
+                    debug_log(f"✓ Created offline event for complete gap: {gap_duration:.1f}s")
+                else:
+                    debug_log(
+                        f"✗ Failed to create offline event: HTTP {response.status_code}"
+                    )
+            except Exception as insert_err:
+                debug_log(
+                    f"✗ Exception during insert: {type(insert_err).__name__}: {insert_err}"
+                )
+            return
+
+        debug_log(
+            f"Found {len(afk_events)} afk events (covered by heartbeats, no offline events needed)"
+        )
+
+    except Exception as e:
+        # Silently fail to avoid daemon crash
+        debug_log(f"Error in offline detection: {e}")
 
 
 if __name__ == "__main__":
