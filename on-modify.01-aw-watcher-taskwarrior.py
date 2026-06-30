@@ -4,7 +4,22 @@
 # TaskWarrior hook to send heartbeats to ActivityWatch
 
 # License: GNU GPLv3
-#
+# FIX: Something is werid when checking the response, right now it claims that the event was successfully created but the event per se doesn't exists on the bucket, or is it a collision?
+"""
+[2026-06-30T00:57:25.870644+00:00] Heartbeat: Instalar contactos y apagadores | Tags: ['OFFLINE']
+[2026-06-30T00:57:28.874934+00:00] Heartbeat: Instalar contactos y apagadores | Tags: ['OFFLINE']
+[2026-06-30T00:57:31.879131+00:00] Heartbeat: Instalar contactos y apagadores | Tags: ['OFFLINE']
+[2026-06-30T03:30:58.477864+00:00] Checking offline gaps: 9206.6s since last heartbeat
+[2026-06-30T03:30:59.547095+00:00] Querying aw-watcher-afk_HerreraMonroy from 2026-06-30 00:57:31.878781+00:00 to 2026-06-30 03:30:58.476225+00:00
+[2026-06-30T03:31:18.598536+00:00] No afk events found - system was offline for entire gap (9206.6s)
+[2026-06-30T03:31:18.616015+00:00] Posting to http://localhost:5600/api/0/buckets/aw-watcher-taskwarrior_HerreraMonroy/events: {'timestamp': '2026-06-30 00:57:31.878782+00:00', 'data': {'title': 'Instalar contactos y apagadores', 'project': 'Ecosistema.Hábitat.Mantenimiento del hogar.Recámara', 'tags': ['OFFLINE'], 'uuid': 'e7e9d2b1-9f68-484c-ad44-29c9e5889027'}, 'duration': 9206}
+[2026-06-30T03:31:19.061047+00:00] Response status: 200, text: null
+
+[2026-06-30T03:31:19.061412+00:00] ✓ Created offline event for complete gap: 9206.6s
+[2026-06-30T03:31:19.101486+00:00] Heartbeat: Instalar contactos y apagadores | Tags: ['OFFLINE']
+[2026-06-30T03:31:22.105818+00:00] Heartbeat: Instalar contactos y apagadores | Tags: ['OFFLINE']
+[2026-06-30T03:31:25.110123+00:00] Heartbeat: Instalar contactos y apagadores | Tags: ['OFFLINE']
+"""
 
 import json
 import os
