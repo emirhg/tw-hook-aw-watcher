@@ -115,14 +115,20 @@ def heartbeat_daemon():
                 "tags": task_tags,
                 "uuid": current_task.get("uuid"),
             }
-            # Check for offline gaps if task is marked as OFFLINE (before updating heartbeat time)
-            if "OFFLINE" in task_tags:
-                # BUG: The caller ignores the result of the called function and therefore an event and a heartbeat are created during the same loop. Is not a big deal, but it can be considered a bug.
-                check_and_create_offline_events(
-                    client, bucket_id, last_heartbeat_time, payload_task_data
-                )
 
             now = datetime.now(timezone.utc)
+
+            # Check for offline gaps if task is marked as OFFLINE (before updating heartbeat time)
+            if "OFFLINE" in task_tags:
+                offline_event_created = check_and_create_offline_events(
+                    client, bucket_id, last_heartbeat_time, now, payload_task_data
+                )
+                # Skip heartbeat if offline event was created to avoid overlap
+                if offline_event_created:
+                    last_heartbeat_time = now
+                    time.sleep(HEARTBEAT_FREQUENCY)
+                    continue
+
             last_heartbeat_time = now
             heartbeat_event = Event(timestamp=now, data=payload_task_data)
 
@@ -202,20 +208,21 @@ def start_daemon():
 
 
 def check_and_create_offline_events(
-    client, bucket_id, last_heartbeat_time: datetime, payload_task_data
-):
+    client, bucket_id, last_heartbeat_time: datetime, now: datetime, payload_task_data
+) -> bool:
     """
     Checks if system was offline since last heartbeat by querying the afk bucket.
     Only checks if there's been a gap in heartbeats (> 2 heartbeat intervals).
     Creates offline events for gaps where there was no user activity.
+
+    Returns True if an offline event was created, False otherwise.
     """
     try:
-        now = datetime.now(timezone.utc)
         time_since_heartbeat = (now - last_heartbeat_time).total_seconds()
 
         # Only check if heartbeats have actually stopped (gap > threshold)
         if time_since_heartbeat <= OFFLINE_DETECTION_THRESHOLD:
-            return
+            return False
 
         debug_log(
             f"Checking offline gaps: {time_since_heartbeat:.1f}s since last heartbeat"
@@ -255,6 +262,7 @@ def check_and_create_offline_events(
                     debug_log(
                         f"✓ Created offline event for complete gap: {gap_duration:.1f}s"
                     )
+                    return True
                 else:
                     debug_log(
                         f"✗ Failed to create offline event: HTTP {response.status_code}"
@@ -263,15 +271,17 @@ def check_and_create_offline_events(
                 debug_log(
                     f"✗ Exception during insert: {type(insert_err).__name__}: {insert_err}"
                 )
-            return
+            return False
 
         debug_log(
             f"Found {len(afk_events)} afk events (covered by heartbeats, no offline events needed)"
         )
+        return False
 
     except Exception as e:
         # Silently fail to avoid daemon crash
         debug_log(f"Error in offline detection: {e}")
+        return False
 
 
 if __name__ == "__main__":
