@@ -24,7 +24,9 @@
 import json
 import os
 import sys
+import socket
 import subprocess
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from socket import gethostname
@@ -34,10 +36,8 @@ from aw_client import ActivityWatchClient
 from aw_core.models import Event
 
 # --- Constants ---
-# File to store the LIFO queue of active tasks
-ACTIVE_TASK_FILE = "/tmp/active-task.json"
-# File to store the PID of the daemon process
-PID_FILE = "/tmp/aw-watcher-taskwarrior.pid"
+# Unix domain socket used for daemon control
+SOCKET_FILE = "/tmp/aw-watcher-taskwarrior.sock"
 # Debug log file
 DEBUG_LOG_FILE = "/tmp/aw-watcher-taskwarrior-debug.log"
 
@@ -47,6 +47,14 @@ PULSETIME = HEARTBEAT_FREQUENCY + 2  # Must be > HEARTBEAT_FREQUENCY
 COMMIT_INTERVAL = 15  # seconds
 SERVER_RETRY_INTERVAL = 30  # seconds
 OFFLINE_DETECTION_THRESHOLD = HEARTBEAT_FREQUENCY * 2  # seconds
+
+# Socket protocol
+SOCKET_RECV_TIMEOUT = 2
+SOCKET_BACKLOG = 1
+DAEMON_STOP_WAIT_TIMEOUT = 2
+ACTION_STOP = "stop"
+ACTION_UPDATE = "update"
+ACTION_STATUS = "status"
 
 
 def debug_log(message):
@@ -60,151 +68,315 @@ def debug_log(message):
         pass
 
 
+class TaskState:
+    def __init__(self, task):
+        self._lock = threading.Lock()
+        self.uuid = task.get("uuid")
+        self._description = task.get("description", "unknown")
+        self._project = task.get("project", "No project")
+        self._tags = task.get("tags", [])
+
+    def update(self, new_task):
+        with self._lock:
+            if "description" in new_task:
+                self._description = new_task["description"]
+            if "project" in new_task:
+                self._project = new_task["project"]
+            if "tags" in new_task:
+                self._tags = new_task["tags"]
+
+    def snapshot(self):
+        with self._lock:
+            tags = list(self._tags)
+            return {
+                "title": self._description,
+                "project": self._project,
+                "tags": tags,
+                "uuid": self.uuid,
+            }, tags
+
+
+def read_task_from_stdin():
+    """Reads and parses the single task JSON piped to the daemon's stdin at startup."""
+    raw = sys.stdin.read()
+    if not raw.strip():
+        debug_log("Daemon received no task data on stdin, aborting")
+        return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as e:
+        debug_log(f"Daemon failed to parse task JSON from stdin: {e}")
+        return None
+
+
+def setup_socket():
+    """Binds and listens on SOCKET_FILE. Removes a stale file first if present."""
+    if os.path.exists(SOCKET_FILE):
+        os.remove(SOCKET_FILE)
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.bind(SOCKET_FILE)
+    except OSError as e:
+        debug_log(f"Failed to bind {SOCKET_FILE}: {e}")
+        sock.close()
+        raise
+    sock.listen(SOCKET_BACKLOG)
+    return sock
+
+
+def cleanup_socket(sock):
+    try:
+        sock.close()
+    except OSError:
+        pass
+    try:
+        if os.path.exists(SOCKET_FILE):
+            os.remove(SOCKET_FILE)
+    except OSError:
+        pass
+
+
+def recv_line(conn, timeout=SOCKET_RECV_TIMEOUT, bufsize=4096):
+    conn.settimeout(timeout)
+    buf = b""
+    try:
+        while not buf.endswith(b"\n"):
+            chunk = conn.recv(bufsize)
+            if not chunk:
+                break
+            buf += chunk
+    except socket.timeout:
+        pass
+    return buf.decode("utf-8", errors="replace").strip()
+
+
+def socket_listener(sock, task_state, stop_event):
+    while True:
+        try:
+            conn, _ = sock.accept()
+        except OSError:
+            debug_log("Socket listener exiting (socket closed)")
+            return
+        with conn:
+            line = recv_line(conn)
+            if not line:
+                continue
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                debug_log(f"Ignoring malformed socket message: {line!r}")
+                continue
+
+            action = msg.get("action")
+            uuid = msg.get("uuid")
+
+            if action == ACTION_STOP:
+                if uuid == task_state.uuid:
+                    debug_log(f"Received stop for tracked task {uuid}")
+                    stop_event.set()
+                else:
+                    debug_log(f"Ignoring stop for {uuid}, tracking {task_state.uuid}")
+            elif action == ACTION_UPDATE:
+                if uuid == task_state.uuid:
+                    task_state.update(msg.get("task", {}))
+                    debug_log(f"Updated tracked task metadata for {uuid}")
+                else:
+                    debug_log(f"Ignoring update for {uuid}, tracking {task_state.uuid}")
+            elif action == ACTION_STATUS:
+                try:
+                    conn.sendall((json.dumps({"uuid": task_state.uuid}) + "\n").encode())
+                except OSError:
+                    pass
+            else:
+                debug_log(f"Unknown socket action: {action!r}")
+
+
 def heartbeat_daemon():
     """
     This function runs as a background daemon, sending heartbeats for the active task.
     """
     debug_log("=== Daemon started ===")
 
-    # Write PID to file to prevent multiple instances
-    with open(PID_FILE, "w") as f:
-        f.write(str(os.getpid()))
+    task = read_task_from_stdin()
+    if task is None or not task.get("uuid"):
+        debug_log("No valid task on stdin, daemon exiting")
+        sys.exit(1)
 
-    # Connect to ActivityWatch server
+    task_state = TaskState(task)
+    stop_event = threading.Event()
+
+    try:
+        sock = setup_socket()
+    except OSError:
+        sys.exit(1)
+
+    listener = threading.Thread(
+        target=socket_listener, args=(sock, task_state, stop_event), daemon=True
+    )
+    listener.start()
+
     client = ActivityWatchClient("aw-watcher-taskwarrior", testing=False)
     bucket_id = f"aw-watcher-taskwarrior_{gethostname()}"
     debug_log(f"Connecting to bucket: {bucket_id}")
 
-    # Loop to ensure bucket exists, retry if aw-server is not available
-    while True:
-        try:
-            client.create_bucket(bucket_id, event_type="task-activity")
-            debug_log("Bucket created/connected successfully")
-            break
-        except Exception as e:
-            debug_log(
-                f"Failed to create bucket, retrying in {SERVER_RETRY_INTERVAL}s: {e}"
-            )
-            time.sleep(SERVER_RETRY_INTERVAL)
-
-    last_heartbeat_time = datetime.now(timezone.utc)
-
-    with client:
-        while os.path.exists(ACTIVE_TASK_FILE):
-            try:
-                with open(ACTIVE_TASK_FILE, "r") as f:
-                    active_tasks = json.load(f)
-            except (IOError, json.JSONDecodeError):
-                time.sleep(1)
-                continue
-
-            # This handles a transient state where the task file is empty but
-            # not yet deleted by the hook script. It prevents a crash.
-            if not active_tasks:
-                time.sleep(1)
-                continue
-
-            # Get the last task from the LIFO queue (most recently started)
-            current_task = active_tasks[-1]
-            task_desc = current_task.get("description", "unknown")
-            task_tags = current_task.get("tags", [])
-
-            payload_task_data = {
-                "title": task_desc,
-                "project": current_task.get("project", "No project"),
-                "tags": task_tags,
-                "uuid": current_task.get("uuid"),
-            }
-
-            now = datetime.now(timezone.utc)
-
-            # Check for offline gaps if task is marked as OFFLINE (before updating heartbeat time)
-            if "OFFLINE" in task_tags:
-                offline_event_created = check_and_create_offline_events(
-                    client, bucket_id, last_heartbeat_time, now, payload_task_data
-                )
-                # Skip heartbeat if offline event was created to avoid overlap
-                if offline_event_created:
-                    last_heartbeat_time = now
-                    time.sleep(HEARTBEAT_FREQUENCY)
-                    continue
-
-            last_heartbeat_time = now
-            heartbeat_event = Event(timestamp=now, data=payload_task_data)
-
-            client.heartbeat(
-                bucket_id,
-                heartbeat_event,
-                pulsetime=PULSETIME,
-                queued=True,
-                commit_interval=COMMIT_INTERVAL,
-            )
-            debug_log(f"Heartbeat: {task_desc} | Tags: {task_tags}")
-
-            time.sleep(HEARTBEAT_FREQUENCY)
-
-    # Clean up PID file on exit
-    if os.path.exists(PID_FILE):
-        os.remove(PID_FILE)
-
-
-def get_active_tasks():
-    """Reads the list of active tasks from the JSON file."""
-    if not os.path.exists(ACTIVE_TASK_FILE):
-        return []
     try:
-        with open(ACTIVE_TASK_FILE, "r") as f:
-            return json.load(f)
-    except (IOError, json.JSONDecodeError):
-        return []
+        while not stop_event.is_set():
+            try:
+                client.create_bucket(bucket_id, event_type="task-activity")
+                debug_log("Bucket created/connected successfully")
+                break
+            except Exception as e:
+                debug_log(
+                    f"Failed to create bucket, retrying in {SERVER_RETRY_INTERVAL}s: {e}"
+                )
+                stop_event.wait(SERVER_RETRY_INTERVAL)
 
+        if stop_event.is_set():
+            debug_log("Stop received during bucket setup, exiting before first heartbeat")
+            return
 
-def write_active_tasks(tasks):
-    """Writes the list of active tasks to the JSON file."""
-    with open(ACTIVE_TASK_FILE, "w") as f:
-        json.dump(tasks, f, indent=2)
+        last_heartbeat_time = datetime.now(timezone.utc)
+
+        with client:
+            while not stop_event.is_set():
+                payload_task_data, task_tags = task_state.snapshot()
+                task_desc = payload_task_data["title"]
+                now = datetime.now(timezone.utc)
+
+                if "OFFLINE" in task_tags:
+                    offline_event_created = check_and_create_offline_events(
+                        client, bucket_id, last_heartbeat_time, now, payload_task_data
+                    )
+                    if offline_event_created:
+                        last_heartbeat_time = now
+                        stop_event.wait(HEARTBEAT_FREQUENCY)
+                        continue
+
+                last_heartbeat_time = now
+                heartbeat_event = Event(timestamp=now, data=payload_task_data)
+                client.heartbeat(
+                    bucket_id,
+                    heartbeat_event,
+                    pulsetime=PULSETIME,
+                    queued=True,
+                    commit_interval=COMMIT_INTERVAL,
+                )
+                debug_log(f"Heartbeat: {task_desc} | Tags: {task_tags}")
+
+                stop_event.wait(HEARTBEAT_FREQUENCY)
+
+        debug_log("=== Daemon stopping (stop signal received) ===")
+    finally:
+        cleanup_socket(sock)
 
 
 def is_daemon_running():
-    """Checks if the heartbeat daemon is currently running."""
-    if not os.path.exists(PID_FILE):
+    """True if a daemon is actively listening on SOCKET_FILE.
+    A socket file left behind by a crashed daemon (stale) is cleaned up here."""
+    if not os.path.exists(SOCKET_FILE):
         return False
-    with open(PID_FILE, "r") as f:
-        try:
-            pid = int(f.read())
-        except ValueError:
-            return False
-
-    # Check if a process with this PID is running (Unix-like specific)
     try:
-        os.kill(pid, 0)
-    except OSError:
-        return False
-    else:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(SOCKET_RECV_TIMEOUT)
+            s.connect(SOCKET_FILE)
         return True
+    except (ConnectionRefusedError, FileNotFoundError, socket.timeout, OSError) as e:
+        debug_log(f"Stale socket file detected ({e}), removing")
+        try:
+            os.remove(SOCKET_FILE)
+        except OSError:
+            pass
+        return False
 
 
-def start_daemon():
-    """
-    Starts the heartbeat daemon as a detached background process.
-    """
-    if is_daemon_running():
+def query_daemon_uuid():
+    """Returns the uuid the running daemon is tracking, or None if no daemon
+    is running / it didn't answer in time. Never raises."""
+    if not os.path.exists(SOCKET_FILE):
+        return None
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(SOCKET_RECV_TIMEOUT)
+            s.connect(SOCKET_FILE)
+            s.sendall((json.dumps({"action": ACTION_STATUS}) + "\n").encode())
+            line = recv_line(s)
+        if not line:
+            return None
+        return json.loads(line).get("uuid")
+    except (ConnectionRefusedError, FileNotFoundError, socket.timeout,
+            OSError, json.JSONDecodeError) as e:
+        debug_log(f"query_daemon_uuid failed: {e}")
+        return None
+
+
+def _connect_with_retry(attempts=3, delay=0.2):
+    """Small bounded retry to absorb the start->stop race (daemon subprocess
+    may not have finished binding its socket yet). Total worst case ~0.6s."""
+    last_err = None
+    for _ in range(attempts):
+        try:
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.settimeout(SOCKET_RECV_TIMEOUT)
+            s.connect(SOCKET_FILE)
+            return s
+        except (ConnectionRefusedError, FileNotFoundError, OSError) as e:
+            last_err = e
+            time.sleep(delay)
+    debug_log(f"Could not connect to daemon socket after retries: {last_err}")
+    return None
+
+
+def send_stop_signal(task_uuid):
+    """Best-effort; must never raise (a hook exception can block TaskWarrior)."""
+    s = _connect_with_retry()
+    if s is None:
         return
+    try:
+        with s:
+            s.sendall((json.dumps({"action": ACTION_STOP, "uuid": task_uuid}) + "\n").encode())
+    except OSError as e:
+        debug_log(f"Error sending stop signal: {e}")
 
-    # Command to re-execute this script with the --daemon flag
+
+def send_update_signal(task_uuid, new_task):
+    s = _connect_with_retry(attempts=1)
+    if s is None:
+        return
+    try:
+        with s:
+            msg = {"action": ACTION_UPDATE, "uuid": task_uuid, "task": new_task}
+            s.sendall((json.dumps(msg) + "\n").encode())
+    except OSError as e:
+        debug_log(f"Error sending update signal: {e}")
+
+
+def wait_for_daemon_exit(timeout=DAEMON_STOP_WAIT_TIMEOUT):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not is_daemon_running():
+            return True
+        time.sleep(0.1)
+    debug_log("Timed out waiting for previous daemon to exit")
+    return False
+
+
+def start_daemon(new_task):
+    """Starts the heartbeat daemon as a detached background process, piping
+    the task JSON to its stdin so it knows what to track at startup."""
     command = [sys.executable, __file__, "--daemon"]
-
-    # Use Popen to launch a detached process.
-    # preexec_fn=os.setsid ensures the new process is in its own session.
-    # Redirecting stdin/out/err to DEVNULL is crucial for full detachment.
-    subprocess.Popen(
+    proc = subprocess.Popen(
         command,
         close_fds=True,
         preexec_fn=os.setsid,
-        stdin=subprocess.DEVNULL,
+        stdin=subprocess.PIPE,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+    if proc.stdin:
+        try:
+            proc.stdin.write(json.dumps(new_task).encode())
+        finally:
+            proc.stdin.close()
 
 
 def check_and_create_offline_events(
@@ -285,19 +457,16 @@ def check_and_create_offline_events(
 
 
 if __name__ == "__main__":
-    # If '--daemon' is passed, this script becomes the daemon.
     if len(sys.argv) > 1 and sys.argv[1] == "--daemon":
         heartbeat_daemon()
         sys.exit(0)
 
-    # Otherwise, it runs as the TaskWarrior hook.
     old_task_str = sys.stdin.readline()
     new_task_str = sys.stdin.readline()
-
     old_task = json.loads(old_task_str) if old_task_str.strip() else {}
     new_task = json.loads(new_task_str) if new_task_str.strip() else {}
 
-    # TaskWarrior hook protocol requires writing the modified task back to stdout
+    # TaskWarrior hook protocol: must echo the (possibly modified) task back.
     if new_task:
         print(json.dumps(new_task))
     elif old_task:
@@ -312,31 +481,45 @@ if __name__ == "__main__":
     is_active_before = "start" in old_task
     is_active_after = "start" in new_task
 
-    active_tasks = get_active_tasks()
-    active_uuids = {t["uuid"] for t in active_tasks}
+    try:
+        if is_active_after and not is_active_before:
+            # Case 1: task started.
+            current_uuid = query_daemon_uuid()
 
-    # Case 1: Task is started
-    if is_active_after and task_uuid not in active_uuids:
-        active_tasks.append(new_task)
-        write_active_tasks(active_tasks)
-        start_daemon()
+            if current_uuid == task_uuid:
+                # Shouldn't normally happen (is_active_before was False), but
+                # defend against duplicate/out-of-order hook invocations.
+                debug_log(f"Task {task_uuid} already tracked, ignoring duplicate start")
 
-    # Case 2: Task is stopped or deleted while active
-    elif not is_active_after and task_uuid in active_uuids:
-        active_tasks = [t for t in active_tasks if t["uuid"] != task_uuid]
-        if not active_tasks:
-            if os.path.exists(ACTIVE_TASK_FILE):
-                os.remove(ACTIVE_TASK_FILE)
-        else:
-            write_active_tasks(active_tasks)
+            elif current_uuid is not None:
+                # Single-daemon policy: starting a new task stops tracking of the old one.
+                debug_log(f"Switching daemon from {current_uuid} to {task_uuid}")
+                send_stop_signal(current_uuid)
+                wait_for_daemon_exit()
+                start_daemon(new_task)
 
-    # Case 3: Task is modified while active
-    elif is_active_after and task_uuid in active_uuids:
-        # Find and update the task in the list to reflect changes
-        for i, task in enumerate(active_tasks):
-            if task["uuid"] == task_uuid:
-                active_tasks[i] = new_task
-                break
-        write_active_tasks(active_tasks)
+            else:
+                start_daemon(new_task)
+
+        elif not is_active_after and is_active_before:
+            # Case 2: task stopped, completed, or deleted while active.
+            send_stop_signal(task_uuid)
+
+        elif is_active_after and is_active_before:
+            # Case 3: task modified while active (description/project/tags).
+            current_uuid = query_daemon_uuid()
+            if current_uuid == task_uuid:
+                send_update_signal(task_uuid, new_task)
+            else:
+                debug_log(
+                    f"Modified task {task_uuid} is not the daemon's tracked "
+                    f"task ({current_uuid}); ignoring update"
+                )
+        # else: task inactive before and after -> nothing to do.
+
+    except Exception as e:
+        # A hook exception must never propagate: TaskWarrior blocks the
+        # underlying task command (start/stop/modify) on hook failure.
+        debug_log(f"Unhandled hook error: {type(e).__name__}: {e}")
 
     sys.exit(0)
