@@ -258,8 +258,7 @@ def heartbeat_daemon():
                     bucket_id,
                     heartbeat_event,
                     pulsetime=PULSETIME,
-                    queued=True,
-                    commit_interval=COMMIT_INTERVAL,
+                    queued=False,
                 )
                 debug_log(f"Heartbeat: {task_desc} | Tags: {task_tags}")
 
@@ -421,7 +420,7 @@ def check_and_create_offline_events(
             try:
                 url = f"http://localhost:5600/api/0/buckets/{bucket_id}/events"
                 payload = {
-                    "timestamp": str(offline_event_start),
+                    "timestamp": offline_event_start.isoformat(),
                     "data": payload_task_data,
                     "duration": int(gap_duration),
                 }
