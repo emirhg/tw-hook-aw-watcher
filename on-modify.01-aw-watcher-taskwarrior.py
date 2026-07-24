@@ -215,7 +215,13 @@ def heartbeat_daemon():
     )
     listener.start()
 
-    client = ActivityWatchClient("aw-watcher-taskwarrior", testing=False)
+    try:
+        client = ActivityWatchClient("aw-watcher-taskwarrior", testing=False)
+    except Exception as e:
+        debug_log(f"Failed to create ActivityWatch client: {type(e).__name__}: {e}")
+        cleanup_socket(sock)
+        sys.exit(1)
+
     bucket_id = f"aw-watcher-taskwarrior_{gethostname()}"
     debug_log(f"Connecting to bucket: {bucket_id}")
 
@@ -254,13 +260,8 @@ def heartbeat_daemon():
 
                 last_heartbeat_time = now
                 heartbeat_event = Event(timestamp=now, data=payload_task_data)
-                client.heartbeat(
-                    bucket_id,
-                    heartbeat_event,
-                    pulsetime=PULSETIME,
-                    queued=False,
-                )
-                debug_log(f"Heartbeat: {task_desc} | Tags: {task_tags}")
+                if send_heartbeat_with_retry(client, bucket_id, heartbeat_event):
+                    debug_log(f"Heartbeat: {task_desc} | Tags: {task_tags}")
 
                 stop_event.wait(HEARTBEAT_FREQUENCY)
 
@@ -359,23 +360,226 @@ def wait_for_daemon_exit(timeout=DAEMON_STOP_WAIT_TIMEOUT):
     return False
 
 
+def parse_tw_timestamp(tw_ts):
+    """Parse TaskWarrior UTC timestamp (format: 20260723T200958Z) into aware datetime."""
+    try:
+        return datetime.strptime(tw_ts, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
+    except Exception as e:
+        debug_log(f"Error parsing TaskWarrior timestamp {tw_ts}: {e}")
+        return None
+
+
+def get_last_tracked_event_end(client, bucket_id, task_uuid, since):
+    """
+    Query the taskwarrior bucket for events matching task_uuid between since and now.
+    Returns the end time of the most recent matching event, or since if none found.
+    """
+    try:
+        now = datetime.now(timezone.utc)
+        events = client.get_events(bucket_id, start=since, end=now, limit=-1)
+
+        if not events:
+            debug_log(f"No events found for task {task_uuid} since {since}, using task start as baseline")
+            return since
+
+        # Filter to events from this task (defend against stale events from previous tasks)
+        matching_events = [e for e in events if e.data.get("uuid") == task_uuid]
+        if not matching_events:
+            debug_log(f"No events found for task {task_uuid} in bucket {bucket_id}, using task start as baseline")
+            return since
+
+        # Find the latest event end (duration is already a timedelta)
+        last_event = max(matching_events, key=lambda e: e.timestamp + e.duration)
+        last_event_end = last_event.timestamp + last_event.duration
+        debug_log(f"Last tracked event for {task_uuid} ended at {last_event_end}")
+        return last_event_end
+    except Exception as e:
+        debug_log(f"Error querying last tracked event: {type(e).__name__}: {e}, using task start as baseline")
+        return since
+
+
+def get_active_task():
+    """Query TaskWarrior for the active task. Returns task dict or None."""
+    try:
+        result = subprocess.run(
+            ["task", "rc.hooks:off", "status:pending", "start.any:", "export"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            tasks = json.loads(result.stdout)
+            if tasks:
+                return tasks[0]
+        return None
+    except Exception as e:
+        debug_log(f"Error querying active task: {e}")
+        return None
+
+
+def recover_daemon():
+    """
+    Recovery mode: Checks for active task and resumes tracking.
+    Queries TaskWarrior for task start time and ActivityWatch for last tracked event.
+    If task is OFFLINE and gap is significant, backfills using afk-verified offline detection.
+    If task is ONLINE, just resumes tracking without backfilling.
+    """
+    debug_log("=== Recovery mode started ===")
+
+    active_task = get_active_task()
+    if not active_task:
+        debug_log("No active task found, recovery aborted")
+        return False
+
+    task_uuid = active_task.get("uuid")
+    task_desc = active_task.get("description", "unknown")
+    is_offline = "OFFLINE" in active_task.get("tags", [])
+
+    debug_log(
+        f"Found active task: {task_desc} (OFFLINE: {is_offline})"
+    )
+
+    # Check if daemon is already running
+    if is_daemon_running():
+        debug_log(f"Daemon already running for task {task_uuid}, recovery not needed")
+        return False
+
+    # Parse task start time from TaskWarrior
+    tw_start = active_task.get("start")
+    task_start_time = parse_tw_timestamp(tw_start) if tw_start else None
+    if not task_start_time:
+        debug_log(f"Could not parse task start time ({tw_start}), skipping gap computation")
+        last_event_end = None
+    else:
+        debug_log(f"Task started at {task_start_time}")
+
+        # Query ActivityWatch for last tracked event for this task
+        bucket_id = f"aw-watcher-taskwarrior_{gethostname()}"
+        try:
+            client = ActivityWatchClient("aw-watcher-taskwarrior", testing=False)
+            # Best-effort bucket creation (matches daemon's approach)
+            try:
+                with client:
+                    client.create_bucket(bucket_id, event_type="task-activity")
+                    last_event_end = get_last_tracked_event_end(client, bucket_id, task_uuid, task_start_time)
+            except Exception as e:
+                debug_log(f"Could not query bucket: {type(e).__name__}: {e}, using task start as baseline")
+                last_event_end = task_start_time
+        except Exception as e:
+            debug_log(f"Could not create ActivityWatch client: {type(e).__name__}: {e}, using task start as baseline")
+            last_event_end = task_start_time
+
+    # Start daemon
+    debug_log(f"Starting daemon for task {task_uuid}")
+    start_daemon(active_task)
+
+    # Wait for daemon to bind socket (up to 5 seconds with 0.1s polling).
+    # Use direct socket test without aggressive cleanup to avoid race conditions.
+    for attempt in range(50):
+        time.sleep(0.1)
+        try:
+            if os.path.exists(SOCKET_FILE):
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                    s.settimeout(SOCKET_RECV_TIMEOUT)
+                    s.connect(SOCKET_FILE)
+                debug_log("Daemon started successfully")
+                break
+        except (ConnectionRefusedError, FileNotFoundError, socket.timeout, OSError):
+            pass
+    else:
+        debug_log("Failed to start daemon during recovery (socket binding timeout after 5s)")
+        return False
+
+    # Backfill gap if task is marked OFFLINE
+    now = datetime.now(timezone.utc)
+    if last_event_end is not None:
+        gap_seconds = (now - last_event_end).total_seconds()
+        debug_log(f"Gap since last event: {gap_seconds:.1f}s (last event ended at {last_event_end})")
+
+        if is_offline and gap_seconds > OFFLINE_DETECTION_THRESHOLD:
+            debug_log(f"Task is OFFLINE with significant gap ({gap_seconds:.1f}s), checking for offline activity")
+            try:
+                bucket_id = f"aw-watcher-taskwarrior_{gethostname()}"
+                payload_task_data = {
+                    "title": task_desc,
+                    "project": active_task.get("project", "No project"),
+                    "tags": active_task.get("tags", []),
+                    "uuid": task_uuid,
+                }
+
+                client = ActivityWatchClient("aw-watcher-taskwarrior", testing=False)
+                with client:
+                    # Reuse the same offline detection logic as the running daemon
+                    offline_event_created = check_and_create_offline_events(
+                        client, bucket_id, last_event_end, now, payload_task_data
+                    )
+                    if offline_event_created:
+                        debug_log(f"✓ Backfilled offline gap: {gap_seconds:.1f}s")
+                    else:
+                        debug_log(f"No offline event needed (afk activity found or other reason)")
+            except Exception as e:
+                debug_log(f"✗ Exception during offline backfill: {type(e).__name__}: {e}")
+        elif is_offline:
+            debug_log(f"Task is OFFLINE but gap ({gap_seconds:.1f}s) is within threshold, no backfill needed")
+        else:
+            debug_log(f"Task is ONLINE, resuming without backfill (gap: {gap_seconds:.1f}s)")
+    else:
+        debug_log("Could not determine last event end, resuming without backfill")
+
+    debug_log("=== Recovery completed ===")
+    return True
+
+
 def start_daemon(new_task):
     """Starts the heartbeat daemon as a detached background process, piping
     the task JSON to its stdin so it knows what to track at startup."""
     command = [sys.executable, __file__, "--daemon"]
+    stderr_file = open("/tmp/aw-watcher-daemon-stderr.log", "a")
     proc = subprocess.Popen(
         command,
         close_fds=True,
         preexec_fn=os.setsid,
         stdin=subprocess.PIPE,
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stderr=stderr_file,
     )
     if proc.stdin:
         try:
             proc.stdin.write(json.dumps(new_task).encode())
         finally:
             proc.stdin.close()
+
+
+def send_heartbeat_with_retry(client, bucket_id, heartbeat_event, max_retries=3):
+    """
+    Send heartbeat with exponential backoff retry.
+    Returns True if successful, False if all retries exhausted.
+    Logs errors but doesn't crash the daemon.
+    """
+    for attempt in range(max_retries):
+        try:
+            client.heartbeat(
+                bucket_id,
+                heartbeat_event,
+                pulsetime=PULSETIME,
+                queued=False,
+            )
+            return True
+        except Exception as e:
+            if attempt < max_retries - 1:
+                backoff = min(HEARTBEAT_FREQUENCY * (2 ** attempt), 5)
+                debug_log(
+                    f"Heartbeat failed (attempt {attempt + 1}/{max_retries}): {type(e).__name__}: {e}. "
+                    f"Retrying in {backoff:.1f}s"
+                )
+                time.sleep(backoff)
+            else:
+                debug_log(
+                    f"Heartbeat failed after {max_retries} attempts: {type(e).__name__}: {e}. "
+                    f"Skipping this heartbeat cycle."
+                )
+                return False
+    return False
 
 
 def check_and_create_offline_events(
@@ -417,31 +621,47 @@ def check_and_create_offline_events(
             debug_log(
                 f"No afk events found - system was offline for entire gap ({gap_duration:.1f}s)"
             )
-            try:
-                url = f"http://localhost:5600/api/0/buckets/{bucket_id}/events"
-                payload = {
-                    "timestamp": offline_event_start.isoformat(),
-                    "data": payload_task_data,
-                    "duration": int(gap_duration),
-                }
-                debug_log(f"Posting to {url}: {payload}")
-                response = post(url, json=payload, timeout=5)
-                debug_log(
-                    f"Response status: {response.status_code}, text: {response.text}"
-                )
-                if response.status_code == 200:
+            url = f"http://localhost:5600/api/0/buckets/{bucket_id}/events"
+            payload = {
+                "timestamp": offline_event_start.isoformat(),
+                "data": payload_task_data,
+                "duration": int(gap_duration),
+            }
+            debug_log(f"Posting to {url}: {payload}")
+
+            for attempt in range(3):
+                try:
+                    response = post(url, json=payload, timeout=5)
                     debug_log(
-                        f"✓ Created offline event for complete gap: {gap_duration:.1f}s"
+                        f"Response status: {response.status_code}, text: {response.text}"
                     )
-                    return True
-                else:
-                    debug_log(
-                        f"✗ Failed to create offline event: HTTP {response.status_code}"
-                    )
-            except Exception as insert_err:
-                debug_log(
-                    f"✗ Exception during insert: {type(insert_err).__name__}: {insert_err}"
-                )
+                    if response.status_code == 200:
+                        debug_log(
+                            f"✓ Created offline event for complete gap: {gap_duration:.1f}s"
+                        )
+                        return True
+                    elif attempt < 2:
+                        backoff = min(HEARTBEAT_FREQUENCY * (2 ** attempt), 5)
+                        debug_log(
+                            f"✗ HTTP {response.status_code}, retrying in {backoff:.1f}s"
+                        )
+                        time.sleep(backoff)
+                    else:
+                        debug_log(
+                            f"✗ Failed to create offline event after retries: HTTP {response.status_code}"
+                        )
+                except Exception as insert_err:
+                    if attempt < 2:
+                        backoff = min(HEARTBEAT_FREQUENCY * (2 ** attempt), 5)
+                        debug_log(
+                            f"✗ Exception during insert: {type(insert_err).__name__}: {insert_err}. "
+                            f"Retrying in {backoff:.1f}s"
+                        )
+                        time.sleep(backoff)
+                    else:
+                        debug_log(
+                            f"✗ Exception during insert (final attempt): {type(insert_err).__name__}: {insert_err}"
+                        )
             return False
 
         debug_log(
@@ -459,6 +679,10 @@ if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "--daemon":
         heartbeat_daemon()
         sys.exit(0)
+
+    if len(sys.argv) > 1 and sys.argv[1] == "--recover":
+        success = recover_daemon()
+        sys.exit(0 if success else 1)
 
     old_task_str = sys.stdin.readline()
     new_task_str = sys.stdin.readline()
