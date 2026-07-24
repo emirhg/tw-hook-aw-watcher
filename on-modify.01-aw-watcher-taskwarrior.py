@@ -215,24 +215,28 @@ def heartbeat_daemon():
     )
     listener.start()
 
-    try:
-        client = ActivityWatchClient("aw-watcher-taskwarrior", testing=False)
-    except Exception as e:
-        error_msg = f"{type(e).__name__}: {e}"
-        # If another instance is running, that's OK - just use a separate logger
-        if "already running" in str(e).lower():
-            debug_log(f"Another watcher instance detected, continuing anyway: {error_msg}")
-            # Create a basic client-like wrapper that can at least log heartbeats
-            try:
-                client = ActivityWatchClient("aw-watcher-taskwarrior-recovery", testing=False)
-            except Exception as e2:
-                debug_log(f"Failed to create backup client: {type(e2).__name__}: {e2}")
-                cleanup_socket(sock)
-                sys.exit(1)
-        else:
-            debug_log(f"Failed to create ActivityWatch client: {error_msg}")
-            cleanup_socket(sock)
-            sys.exit(1)
+    # Try to create ActivityWatch client with unique app name to avoid singleton conflicts
+    client = None
+    client_names = [
+        "aw-watcher-taskwarrior",
+        f"aw-watcher-taskwarrior-{os.getpid()}",
+        "aw-watcher-taskwarrior-recovery",
+    ]
+
+    for client_name in client_names:
+        try:
+            debug_log(f"Trying to connect to ActivityWatch as '{client_name}'")
+            client = ActivityWatchClient(client_name, testing=False)
+            debug_log(f"✓ Connected as '{client_name}'")
+            break
+        except Exception as e:
+            debug_log(f"Failed with '{client_name}': {type(e).__name__}: {e}")
+            continue
+
+    if client is None:
+        debug_log("Failed to create ActivityWatch client with any app name")
+        cleanup_socket(sock)
+        sys.exit(1)
 
     bucket_id = f"aw-watcher-taskwarrior_{gethostname()}"
     debug_log(f"Connecting to bucket: {bucket_id}")
@@ -255,29 +259,34 @@ def heartbeat_daemon():
 
         last_heartbeat_time = datetime.now(timezone.utc)
 
-        with client:
-            while not stop_event.is_set():
-                payload_task_data, task_tags = task_state.snapshot()
-                task_desc = payload_task_data["title"]
-                now = datetime.now(timezone.utc)
+        try:
+            with client:
+                while not stop_event.is_set():
+                    payload_task_data, task_tags = task_state.snapshot()
+                    task_desc = payload_task_data["title"]
+                    now = datetime.now(timezone.utc)
 
-                if "OFFLINE" in task_tags:
-                    offline_event_created = check_and_create_offline_events(
-                        client, bucket_id, last_heartbeat_time, now, payload_task_data
-                    )
-                    if offline_event_created:
-                        last_heartbeat_time = now
-                        stop_event.wait(HEARTBEAT_FREQUENCY)
-                        continue
+                    if "OFFLINE" in task_tags:
+                        offline_event_created = check_and_create_offline_events(
+                            client, bucket_id, last_heartbeat_time, now, payload_task_data
+                        )
+                        if offline_event_created:
+                            last_heartbeat_time = now
+                            stop_event.wait(HEARTBEAT_FREQUENCY)
+                            continue
 
-                last_heartbeat_time = now
-                heartbeat_event = Event(timestamp=now, data=payload_task_data)
-                if send_heartbeat_with_retry(client, bucket_id, heartbeat_event):
-                    debug_log(f"Heartbeat: {task_desc} | Tags: {task_tags}")
+                    last_heartbeat_time = now
+                    heartbeat_event = Event(timestamp=now, data=payload_task_data)
+                    if send_heartbeat_with_retry(client, bucket_id, heartbeat_event):
+                        debug_log(f"Heartbeat: {task_desc} | Tags: {task_tags}")
 
-                stop_event.wait(HEARTBEAT_FREQUENCY)
+                    stop_event.wait(HEARTBEAT_FREQUENCY)
 
-        debug_log("=== Daemon stopping (stop signal received) ===")
+            debug_log("=== Daemon stopping (stop signal received) ===")
+        except Exception as e:
+            debug_log(f"✗ Error in daemon heartbeat loop: {type(e).__name__}: {e}")
+            import traceback
+            debug_log(f"Traceback: {traceback.format_exc()}")
     finally:
         cleanup_socket(sock)
 
