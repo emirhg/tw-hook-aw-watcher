@@ -19,13 +19,14 @@
    - Reads old/new task state from stdin (TaskWarrior hook protocol)
    - Sends single event when task stops or changes
 
-2. **`on-modify.01-aw-watcher-taskwarrior.py`** (main component, 525 lines)
-   - Modern daemon-based implementation
+2. **`on-modify.01-aw-watcher-taskwarrior.py`** (main component, 750+ lines)
+   - Modern daemon-based implementation with recovery mechanism
    - Runs as background process for active tasks
    - Sends heartbeats every `HEARTBEAT_FREQUENCY` seconds (default: 3s)
    - Handles offline gap detection and event creation
    - Uses Unix domain socket (`/tmp/aw-watcher-taskwarrior.sock`) for control
    - Manages task metadata updates and stop signals via socket protocol
+   - **Recovery mode** (`--recover` flag): Detects active task and reconstructs timeline from ActivityWatch queries
 
 ### Core Components
 
@@ -64,6 +65,22 @@ Commands are JSON objects sent to `/tmp/aw-watcher-taskwarrior.sock`:
 - If offline detected, creates a single event spanning the gap
 - Prevents heartbeat overlap by skipping heartbeat if offline event created
 
+#### Recovery Mechanism (`recover_daemon()`)
+Restores tracking state when daemon crashes but task remains active:
+1. **Query TaskWarrior** for active task and its start time
+2. **Query ActivityWatch** for last tracked event to determine timeline
+3. **Compute gaps**: from task start → first event, and last event → now
+4. **Intelligent backfilling** (before daemon starts):
+   - **OFFLINE tasks** (with `OFFLINE` tag): Always backfill gaps (trust the tag)
+   - **ONLINE tasks** (no tag): Only backfill if afk activity confirmed (user was at keyboard)
+5. **Start daemon** after backfill completes to avoid heartbeat race conditions
+
+Helper functions:
+- `_create_offline_event()`: Directly POST offline event to ActivityWatch
+- `_has_afk_activity()`: Check afk bucket for user activity in time window
+- `get_last_tracked_event_end()`: Query ActivityWatch for last event timestamp
+- `parse_tw_timestamp()`: Parse TaskWarrior's UTC format (`20260723T200958Z`)
+
 ### Key Constants & Settings
 
 ```
@@ -78,7 +95,17 @@ DEBUG_LOG_FILE = /tmp/aw-watcher-taskwarrior-debug.log
 
 ## Recent Changes
 
-### Latest: Disable Heartbeat Queue Persistence (d0a6bee)
+### Latest: Intelligent Gap-Filling Recovery Mechanism (ccc0390)
+- Added `recover_daemon()` function: Detects active task and reconstructs timeline from ActivityWatch
+- **Online/offline distinction**:
+  - OFFLINE tasks: Always backfill gaps (trust the tag, no afk verification)
+  - ONLINE tasks: Only backfill if afk activity confirmed (user was working)
+- **Query-based gap detection**: Uses TaskWarrior start time and ActivityWatch last event (not debug log parsing)
+- **Daemon startup timing**: Backfill completes before daemon starts to prevent heartbeat race conditions
+- Added helper functions: `_create_offline_event()`, `_has_afk_activity()`, `get_last_tracked_event_end()`, `parse_tw_timestamp()`
+- Invoked via `python3 on-modify.01-aw-watcher-taskwarrior.py --recover`
+
+### Previous: Disable Heartbeat Queue Persistence (d0a6bee)
 - Changed from `queued=True, commit_interval=15` to `queued=False`
 - Reason: Persistent queue caused stale heartbeat replay after system suspend/resume
 - Race condition: Queue would replay old heartbeats, corrupting offline events via server-side merge
@@ -105,6 +132,21 @@ DEBUG_LOG_FILE = /tmp/aw-watcher-taskwarrior-debug.log
 
 ## Known Issues & Fixes
 
+### ✅ FIXED: Daemon Crash Loses Tracking Context
+**Issue**: When daemon crashes or is killed, tracking state is lost. Restarting TaskWarrior hook starts new daemon from current time, leaving gap with no recorded activity.
+
+**Root Cause**: No recovery mechanism existed to detect and backfill gaps when daemon unexpectedly terminated.
+
+**Fix**: Implemented `recover_daemon()` with intelligent gap-filling:
+- Queries TaskWarrior for active task and start time
+- Queries ActivityWatch for last tracked event
+- Computes gaps from task start → first event and last event → now
+- For OFFLINE tasks: Creates offline event for all significant gaps (trust the tag)
+- For ONLINE tasks: Only creates recovery event if afk activity confirmed (user was at keyboard)
+- Starts daemon after backfill completes to prevent race conditions
+
+**Usage**: `python3 on-modify.01-aw-watcher-taskwarrior.py --recover`
+
 ### ✅ FIXED: Offline Events Disappearing After System Suspend
 **Issue**: After system suspend/resume, offline events would disappear from bucket despite 200 OK response.
 
@@ -125,10 +167,19 @@ DEBUG_LOG_FILE = /tmp/aw-watcher-taskwarrior-debug.log
 5. Start a task: `task start`
 6. Stop a task: `task stop`
 
+### Recovery Testing
+1. Start a task: `task start`
+2. Kill the daemon: `pkill -f "python.*--daemon"`
+3. Run recovery: `python3 on-modify.01-aw-watcher-taskwarrior.py --recover`
+4. Check debug log for gap detection and backfill messages:
+   - For OFFLINE tasks: Should see "backfilling all significant gaps"
+   - For ONLINE tasks: Should see "checking for afk activity to verify work"
+5. Verify recovery events in ActivityWatch (check bucket with correct timestamp range)
+
 ### Known Issues
-- Debug log at line 7 documents potential response validation issues when events appear not to exist despite 200 status
-- Offline event collision edge cases when multiple gaps detected
+- Timezone handling: Recovery uses UTC timestamps; adjust for local timezone if needed
 - Socket cleanup may fail if daemon exits uncleanly (manual `rm /tmp/aw-watcher-taskwarrior.sock` sometimes needed)
+- Offline event collision edge cases when multiple gaps detected simultaneously
 
 ### Dependencies
 - `requests` - HTTP client for ActivityWatch API
@@ -144,8 +195,12 @@ DEBUG_LOG_FILE = /tmp/aw-watcher-taskwarrior-debug.log
 
 ## Next Steps for Contributors
 
-1. **Code Review**: The FIX comment at line 7 suggests investigating response validation
-2. **Testing**: Comprehensive offline detection edge case testing
-3. **Refactoring**: Consider extracting socket protocol handling to separate module
-4. **Documentation**: Add installation guide and troubleshooting to repo
-5. **Feature Ideas**: Event categorization, task filtering, performance metrics
+1. **Timezone Support**: Implement proper timezone handling for recovery (currently uses UTC, should respect local timezone)
+2. **Testing**: Comprehensive offline detection and recovery edge case testing
+3. **Refactoring**: Consider extracting socket protocol and recovery logic to separate modules
+4. **Documentation**: Add installation guide and troubleshooting FAQ to repo
+5. **Feature Ideas**: 
+   - Event categorization by task type or project
+   - Automatic recovery trigger on daemon start failure
+   - Performance metrics dashboard
+   - Web UI for recovery control and event visualization

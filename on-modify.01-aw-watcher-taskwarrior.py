@@ -393,8 +393,13 @@ def parse_tw_timestamp(tw_ts):
 
 def get_last_tracked_event_end(client, bucket_id, task_uuid, since):
     """
-    Query the taskwarrior bucket for events matching task_uuid between since and now.
-    Returns the end time of the most recent matching event, or since if none found.
+    Find the last ActivityWatch event for this task since the given time.
+
+    Queries taskwarrior bucket from 'since' to now, filters events by task UUID
+    (defends against stale events from previous tasks), and returns the end timestamp
+    of the most recent event. Falls back to 'since' if no events found or query fails.
+
+    Returns datetime of the last event's end, or the task start time if no events recorded.
     """
     try:
         now = datetime.now(timezone.utc)
@@ -441,8 +446,12 @@ def get_active_task():
 
 def _create_offline_event(client, bucket_id, start_time: datetime, end_time: datetime, payload_task_data):
     """
-    Directly create an offline event without afk verification.
-    Used for OFFLINE tasks (always backfill) and ONLINE tasks with confirmed afk activity.
+    POST an offline event to ActivityWatch, covering the gap from start_time to end_time.
+
+    Implements retry logic (3 attempts, exponential backoff) to handle transient ActivityWatch errors.
+    Used during recovery for: OFFLINE tasks (always) or ONLINE tasks with confirmed afk activity.
+
+    Returns True if event posted successfully, False after all retries exhausted.
     """
     gap_duration = (end_time - start_time).total_seconds()
     url = f"http://localhost:5600/api/0/buckets/{bucket_id}/events"
@@ -471,9 +480,10 @@ def _create_offline_event(client, bucket_id, start_time: datetime, end_time: dat
 
 def _has_afk_activity(client, start_time: datetime, end_time: datetime) -> bool:
     """
-    Check if there's afk (user activity) in the given time window.
-    Used for ONLINE tasks to verify the user was working during the gap.
-    Returns True if activity found, False otherwise.
+    Query afk-watcher bucket to verify user activity during the gap window.
+
+    For ONLINE tasks during recovery, we only backfill if the user was at the keyboard.
+    Returns True if afk events found in window, False if none found or on query error.
     """
     try:
         afk_bucket_id = f"aw-watcher-afk_{gethostname()}"
@@ -493,10 +503,18 @@ def _has_afk_activity(client, start_time: datetime, end_time: datetime) -> bool:
 
 def recover_daemon():
     """
-    Recovery mode: Checks for active task and resumes tracking.
-    Queries TaskWarrior for task start time and ActivityWatch for last tracked event.
-    If task is OFFLINE and gap is significant, backfills using afk-verified offline detection.
-    If task is ONLINE, just resumes tracking without backfilling.
+    Recovery mode: Restores tracking after daemon crash or termination.
+
+    Flow:
+    1. Query TaskWarrior for active task and its start time
+    2. Query ActivityWatch for last tracked event in bucket
+    3. Compute gaps: task_start -> first_event, last_event -> now
+    4. Intelligently backfill based on task type:
+       - OFFLINE tasks: Always backfill (trust the OFFLINE tag)
+       - ONLINE tasks: Only backfill if afk activity confirms user was working
+    5. Start daemon after backfill completes (prevents heartbeat race)
+
+    Returns True if recovery succeeded, False otherwise.
     """
     debug_log("=== Recovery mode started ===")
 
