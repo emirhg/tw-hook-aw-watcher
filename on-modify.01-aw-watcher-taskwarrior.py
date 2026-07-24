@@ -218,9 +218,21 @@ def heartbeat_daemon():
     try:
         client = ActivityWatchClient("aw-watcher-taskwarrior", testing=False)
     except Exception as e:
-        debug_log(f"Failed to create ActivityWatch client: {type(e).__name__}: {e}")
-        cleanup_socket(sock)
-        sys.exit(1)
+        error_msg = f"{type(e).__name__}: {e}"
+        # If another instance is running, that's OK - just use a separate logger
+        if "already running" in str(e).lower():
+            debug_log(f"Another watcher instance detected, continuing anyway: {error_msg}")
+            # Create a basic client-like wrapper that can at least log heartbeats
+            try:
+                client = ActivityWatchClient("aw-watcher-taskwarrior-recovery", testing=False)
+            except Exception as e2:
+                debug_log(f"Failed to create backup client: {type(e2).__name__}: {e2}")
+                cleanup_socket(sock)
+                sys.exit(1)
+        else:
+            debug_log(f"Failed to create ActivityWatch client: {error_msg}")
+            cleanup_socket(sock)
+            sys.exit(1)
 
     bucket_id = f"aw-watcher-taskwarrior_{gethostname()}"
     debug_log(f"Connecting to bucket: {bucket_id}")
@@ -487,6 +499,11 @@ def recover_daemon():
         except (ConnectionRefusedError, FileNotFoundError, socket.timeout, OSError):
             pass
     else:
+        debug_log("Daemon socket binding timeout after 5s")
+        # Final check: if daemon IS running now (maybe it started late), recovery succeeded
+        if is_daemon_running():
+            debug_log("Daemon is actually running despite timeout, recovery succeeded")
+            return True
         debug_log("Failed to start daemon during recovery (socket binding timeout after 5s)")
         return False
 
