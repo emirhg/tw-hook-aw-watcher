@@ -507,14 +507,25 @@ def _get_online_segments(client, start_time: datetime, end_time: datetime):
         segment_end = None
 
         for event in afk_events:
+            event_start = event.timestamp
             event_end = event.timestamp + event.duration
 
             # Start a new segment if we don't have one
             if segment_start is None:
-                segment_start = event.timestamp
-
-            # The segment extends to the end of this event
-            segment_end = event_end
+                segment_start = event_start
+                segment_end = event_end
+            else:
+                # Check if there's a gap since the last event ended (offline period)
+                gap = (event_start - segment_end).total_seconds()
+                if gap > OFFLINE_DETECTION_THRESHOLD:
+                    # Gap detected - close current segment and start a new one
+                    segments.append((segment_start, segment_end))
+                    debug_log(f"Online segment: {segment_start} to {segment_end} ({(segment_end - segment_start).total_seconds():.0f}s)")
+                    segment_start = event_start
+                    segment_end = event_end
+                else:
+                    # No gap - extend current segment to include this event
+                    segment_end = event_end
 
         # Add the final segment
         if segment_start is not None and segment_end is not None:
