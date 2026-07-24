@@ -439,6 +439,58 @@ def get_active_task():
         return None
 
 
+def _create_offline_event(client, bucket_id, start_time: datetime, end_time: datetime, payload_task_data):
+    """
+    Directly create an offline event without afk verification.
+    Used for OFFLINE tasks (always backfill) and ONLINE tasks with confirmed afk activity.
+    """
+    gap_duration = (end_time - start_time).total_seconds()
+    url = f"http://localhost:5600/api/0/buckets/{bucket_id}/events"
+    payload = {
+        "timestamp": start_time.isoformat(),
+        "data": payload_task_data,
+        "duration": int(gap_duration),
+    }
+    debug_log(f"Posting offline event to {url}: {gap_duration:.1f}s")
+
+    for attempt in range(3):
+        try:
+            response = post(url, json=payload, timeout=5)
+            if response.status_code == 200:
+                debug_log(f"✓ Offline event posted successfully")
+                return True
+            else:
+                debug_log(f"Event POST attempt {attempt+1}/3 failed: {response.status_code}")
+        except Exception as e:
+            debug_log(f"Event POST attempt {attempt+1}/3 failed: {type(e).__name__}: {e}")
+        if attempt < 2:
+            backoff = min(HEARTBEAT_FREQUENCY * (2 ** attempt), 5)
+            time.sleep(backoff)
+    return False
+
+
+def _has_afk_activity(client, start_time: datetime, end_time: datetime) -> bool:
+    """
+    Check if there's afk (user activity) in the given time window.
+    Used for ONLINE tasks to verify the user was working during the gap.
+    Returns True if activity found, False otherwise.
+    """
+    try:
+        afk_bucket_id = f"aw-watcher-afk_{gethostname()}"
+        afk_events = client.get_events(
+            afk_bucket_id,
+            start=start_time,
+            end=end_time,
+            limit=-1,
+        )
+        has_activity = bool(afk_events)
+        debug_log(f"afk bucket check [{start_time} to {end_time}]: {'activity found' if has_activity else 'no activity'}")
+        return has_activity
+    except Exception as e:
+        debug_log(f"Error checking afk activity: {type(e).__name__}: {e}, assuming no activity")
+        return False
+
+
 def recover_daemon():
     """
     Recovery mode: Checks for active task and resumes tracking.
@@ -491,7 +543,74 @@ def recover_daemon():
             debug_log(f"Could not create ActivityWatch client: {type(e).__name__}: {e}, using task start as baseline")
             last_event_end = task_start_time
 
-    # Start daemon
+    # Backfill gaps BEFORE starting daemon to avoid heartbeat race conditions
+    # OFFLINE always backfills, ONLINE only if afk activity confirmed
+    now = datetime.now(timezone.utc)
+    if task_start_time is not None and last_event_end is not None:
+        # Check gap from task start to first event (if any)
+        gap_from_start = (last_event_end - task_start_time).total_seconds()
+        # Check gap from last event to now
+        gap_to_now = (now - last_event_end).total_seconds()
+
+        debug_log(f"Timeline: task started at {task_start_time}, last event ended at {last_event_end}, now {now}")
+        debug_log(f"Gaps: {gap_from_start:.1f}s (start→first event) + {gap_to_now:.1f}s (last event→now)")
+
+        bucket_id = f"aw-watcher-taskwarrior_{gethostname()}"
+        payload_task_data = {
+            "title": task_desc,
+            "project": active_task.get("project", "No project"),
+            "tags": active_task.get("tags", []),
+            "uuid": task_uuid,
+        }
+
+        try:
+            client = ActivityWatchClient("aw-watcher-taskwarrior", testing=False)
+            with client:
+                if is_offline:
+                    # OFFLINE: always backfill (trust the tag, don't verify afk)
+                    debug_log(f"Task is OFFLINE, backfilling all significant gaps")
+
+                    # Backfill initial gap
+                    if gap_from_start > OFFLINE_DETECTION_THRESHOLD:
+                        debug_log(f"Creating offline event for initial gap: {gap_from_start:.1f}s from {task_start_time} to {last_event_end}")
+                        _create_offline_event(client, bucket_id, task_start_time, last_event_end, payload_task_data)
+                        debug_log(f"✓ Created offline event for initial gap")
+
+                    # Backfill final gap
+                    if gap_to_now > OFFLINE_DETECTION_THRESHOLD:
+                        debug_log(f"Creating offline event for final gap: {gap_to_now:.1f}s from {last_event_end} to {now}")
+                        _create_offline_event(client, bucket_id, last_event_end, now, payload_task_data)
+                        debug_log(f"✓ Created offline event for final gap")
+
+                    if gap_from_start <= OFFLINE_DETECTION_THRESHOLD and gap_to_now <= OFFLINE_DETECTION_THRESHOLD:
+                        debug_log(f"Task is OFFLINE but gaps ({gap_from_start:.1f}s + {gap_to_now:.1f}s) are within threshold, no backfill needed")
+                else:
+                    # ONLINE: only backfill if afk activity verified
+                    debug_log(f"Task is ONLINE, checking for afk activity to verify work during gaps")
+
+                    # Check initial gap
+                    if gap_from_start > OFFLINE_DETECTION_THRESHOLD:
+                        if _has_afk_activity(client, task_start_time, last_event_end):
+                            debug_log(f"Found afk activity in initial gap, creating recovery event: {gap_from_start:.1f}s")
+                            _create_offline_event(client, bucket_id, task_start_time, last_event_end, payload_task_data)
+                            debug_log(f"✓ Created recovery event for initial gap")
+                        else:
+                            debug_log(f"No afk activity in initial gap, skipping backfill")
+
+                    # Check final gap
+                    if gap_to_now > OFFLINE_DETECTION_THRESHOLD:
+                        if _has_afk_activity(client, last_event_end, now):
+                            debug_log(f"Found afk activity in final gap, creating recovery event: {gap_to_now:.1f}s")
+                            _create_offline_event(client, bucket_id, last_event_end, now, payload_task_data)
+                            debug_log(f"✓ Created recovery event for final gap")
+                        else:
+                            debug_log(f"No afk activity in final gap, skipping backfill")
+        except Exception as e:
+            debug_log(f"✗ Exception during backfill: {type(e).__name__}: {e}")
+    else:
+        debug_log("Could not determine task start or event end, resuming without backfill")
+
+    # Now start daemon after backfill is complete
     debug_log(f"Starting daemon for task {task_uuid}")
     start_daemon(active_task)
 
@@ -516,60 +635,6 @@ def recover_daemon():
             return True
         debug_log("Failed to start daemon during recovery (socket binding timeout after 5s)")
         return False
-
-    # Backfill gaps if task is marked OFFLINE (both initial and final gaps)
-    now = datetime.now(timezone.utc)
-    if task_start_time is not None and last_event_end is not None:
-        # Check gap from task start to first event (if any)
-        gap_from_start = (last_event_end - task_start_time).total_seconds()
-        # Check gap from last event to now
-        gap_to_now = (now - last_event_end).total_seconds()
-
-        debug_log(f"Timeline: task started at {task_start_time}, last event ended at {last_event_end}, now {now}")
-        debug_log(f"Gaps: {gap_from_start:.1f}s (start→first event) + {gap_to_now:.1f}s (last event→now)")
-
-        if is_offline and (gap_from_start > OFFLINE_DETECTION_THRESHOLD or gap_to_now > OFFLINE_DETECTION_THRESHOLD):
-            debug_log(f"Task is OFFLINE with significant gaps, backfilling")
-            try:
-                bucket_id = f"aw-watcher-taskwarrior_{gethostname()}"
-                payload_task_data = {
-                    "title": task_desc,
-                    "project": active_task.get("project", "No project"),
-                    "tags": active_task.get("tags", []),
-                    "uuid": task_uuid,
-                }
-
-                client = ActivityWatchClient("aw-watcher-taskwarrior", testing=False)
-                with client:
-                    # Backfill initial gap (from task start to first event, if any)
-                    if gap_from_start > OFFLINE_DETECTION_THRESHOLD:
-                        debug_log(f"Backfilling initial gap: {gap_from_start:.1f}s from {task_start_time} to {last_event_end}")
-                        event_created_initial = check_and_create_offline_events(
-                            client, bucket_id, task_start_time, last_event_end, payload_task_data
-                        )
-                        if event_created_initial:
-                            debug_log(f"✓ Created offline event for initial gap: {gap_from_start:.1f}s")
-                        else:
-                            debug_log(f"Initial gap did not require backfill (afk activity detected)")
-
-                    # Backfill final gap (from last event to now)
-                    if gap_to_now > OFFLINE_DETECTION_THRESHOLD:
-                        debug_log(f"Backfilling final gap: {gap_to_now:.1f}s from {last_event_end} to {now}")
-                        event_created_final = check_and_create_offline_events(
-                            client, bucket_id, last_event_end, now, payload_task_data
-                        )
-                        if event_created_final:
-                            debug_log(f"✓ Created offline event for final gap: {gap_to_now:.1f}s")
-                        else:
-                            debug_log(f"Final gap did not require backfill (afk activity detected)")
-            except Exception as e:
-                debug_log(f"✗ Exception during offline backfill: {type(e).__name__}: {e}")
-        elif is_offline:
-            debug_log(f"Task is OFFLINE but gaps ({gap_from_start:.1f}s + {gap_to_now:.1f}s) are within threshold, no backfill needed")
-        else:
-            debug_log(f"Task is ONLINE, resuming without backfill (gaps: {gap_from_start:.1f}s + {gap_to_now:.1f}s)")
-    else:
-        debug_log("Could not determine task start or event end, resuming without backfill")
 
     debug_log("=== Recovery completed ===")
     return True
