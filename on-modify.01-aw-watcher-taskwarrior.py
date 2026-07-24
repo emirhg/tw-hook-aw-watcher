@@ -480,10 +480,12 @@ def _create_offline_event(client, bucket_id, start_time: datetime, end_time: dat
 
 def _has_afk_activity(client, start_time: datetime, end_time: datetime) -> bool:
     """
-    Query afk-watcher bucket to verify user activity during the gap window.
+    Check if system was online during the gap window (for ONLINE task recovery).
 
-    For ONLINE tasks during recovery, we only backfill if the user was at the keyboard.
-    Returns True if afk events found in window, False if none found or on query error.
+    For ONLINE tasks, backfill only if system was on (afk events exist, whether idle or active).
+    If no afk events exist, the system was completely offline → don't backfill.
+
+    Returns True if system was on (any afk events), False if system was completely off.
     """
     try:
         afk_bucket_id = f"aw-watcher-afk_{gethostname()}"
@@ -493,11 +495,14 @@ def _has_afk_activity(client, start_time: datetime, end_time: datetime) -> bool:
             end=end_time,
             limit=-1,
         )
-        has_activity = bool(afk_events)
-        debug_log(f"afk bucket check [{start_time} to {end_time}]: {'activity found' if has_activity else 'no activity'}")
-        return has_activity
+        # System was on if afk events exist (whether afk=true or afk=false)
+        # No afk events means system was completely offline
+        system_was_on = bool(afk_events)
+        status = "system was online" if system_was_on else "system was offline (no events)"
+        debug_log(f"afk bucket check [{start_time} to {end_time}]: {status}")
+        return system_was_on
     except Exception as e:
-        debug_log(f"Error checking afk activity: {type(e).__name__}: {e}, assuming no activity")
+        debug_log(f"Error checking afk activity: {type(e).__name__}: {e}, assuming system was offline")
         return False
 
 
