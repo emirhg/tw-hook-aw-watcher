@@ -478,14 +478,13 @@ def _create_offline_event(client, bucket_id, start_time: datetime, end_time: dat
     return False
 
 
-def _has_afk_activity(client, start_time: datetime, end_time: datetime) -> bool:
+def _get_online_segments(client, start_time: datetime, end_time: datetime):
     """
-    Check if system was online during the gap window (for ONLINE task recovery).
+    Extract continuous online time segments from afk events.
 
-    For ONLINE tasks, backfill only if system was on (afk events exist, whether idle or active).
-    If no afk events exist, the system was completely offline → don't backfill.
-
-    Returns True if system was on (any afk events), False if system was completely off.
+    Returns list of (segment_start, segment_end) tuples for continuous online periods.
+    Online periods are where afk events exist (both afk=true and afk=false).
+    Offline periods (no events) are left as gaps.
     """
     try:
         afk_bucket_id = f"aw-watcher-afk_{gethostname()}"
@@ -495,15 +494,37 @@ def _has_afk_activity(client, start_time: datetime, end_time: datetime) -> bool:
             end=end_time,
             limit=-1,
         )
-        # System was on if afk events exist (whether afk=true or afk=false)
-        # No afk events means system was completely offline
-        system_was_on = bool(afk_events)
-        status = "system was online" if system_was_on else "system was offline (no events)"
-        debug_log(f"afk bucket check [{start_time} to {end_time}]: {status}")
-        return system_was_on
+
+        if not afk_events:
+            debug_log(f"No afk events [{start_time} to {end_time}]: system was completely offline")
+            return []
+
+        # Sort events by timestamp
+        afk_events.sort(key=lambda e: e.timestamp)
+
+        segments = []
+        segment_start = None
+        segment_end = None
+
+        for event in afk_events:
+            event_end = event.timestamp + event.duration
+
+            # Start a new segment if we don't have one
+            if segment_start is None:
+                segment_start = event.timestamp
+
+            # The segment extends to the end of this event
+            segment_end = event_end
+
+        # Add the final segment
+        if segment_start is not None and segment_end is not None:
+            segments.append((segment_start, segment_end))
+            debug_log(f"Online segment: {segment_start} to {segment_end} ({(segment_end - segment_start).total_seconds():.0f}s)")
+
+        return segments
     except Exception as e:
-        debug_log(f"Error checking afk activity: {type(e).__name__}: {e}, assuming system was offline")
-        return False
+        debug_log(f"Error parsing afk events: {type(e).__name__}: {e}")
+        return []
 
 
 def recover_daemon():
@@ -608,26 +629,34 @@ def recover_daemon():
                     if gap_from_start <= OFFLINE_DETECTION_THRESHOLD and gap_to_now <= OFFLINE_DETECTION_THRESHOLD:
                         debug_log(f"Task is OFFLINE but gaps ({gap_from_start:.1f}s + {gap_to_now:.1f}s) are within threshold, no backfill needed")
                 else:
-                    # ONLINE: only backfill if afk activity verified
-                    debug_log(f"Task is ONLINE, checking for afk activity to verify work during gaps")
+                    # ONLINE: backfill only continuous online periods (where afk events exist)
+                    debug_log(f"Task is ONLINE, extracting online time segments")
 
                     # Check initial gap
                     if gap_from_start > OFFLINE_DETECTION_THRESHOLD:
-                        if _has_afk_activity(client, task_start_time, last_event_end):
-                            debug_log(f"Found afk activity in initial gap, creating recovery event: {gap_from_start:.1f}s")
-                            _create_offline_event(client, bucket_id, task_start_time, last_event_end, payload_task_data)
-                            debug_log(f"✓ Created recovery event for initial gap")
+                        debug_log(f"Initial gap: {gap_from_start:.1f}s from {task_start_time} to {last_event_end}")
+                        segments = _get_online_segments(client, task_start_time, last_event_end)
+                        if segments:
+                            for seg_start, seg_end in segments:
+                                duration_s = (seg_end - seg_start).total_seconds()
+                                debug_log(f"Creating recovery event for online segment: {duration_s:.1f}s")
+                                _create_offline_event(client, bucket_id, seg_start, seg_end, payload_task_data)
+                            debug_log(f"✓ Created {len(segments)} recovery event(s) for initial gap")
                         else:
-                            debug_log(f"No afk activity in initial gap, skipping backfill")
+                            debug_log(f"No online periods in initial gap (system was offline)")
 
                     # Check final gap
                     if gap_to_now > OFFLINE_DETECTION_THRESHOLD:
-                        if _has_afk_activity(client, last_event_end, now):
-                            debug_log(f"Found afk activity in final gap, creating recovery event: {gap_to_now:.1f}s")
-                            _create_offline_event(client, bucket_id, last_event_end, now, payload_task_data)
-                            debug_log(f"✓ Created recovery event for final gap")
+                        debug_log(f"Final gap: {gap_to_now:.1f}s from {last_event_end} to {now}")
+                        segments = _get_online_segments(client, last_event_end, now)
+                        if segments:
+                            for seg_start, seg_end in segments:
+                                duration_s = (seg_end - seg_start).total_seconds()
+                                debug_log(f"Creating recovery event for online segment: {duration_s:.1f}s")
+                                _create_offline_event(client, bucket_id, seg_start, seg_end, payload_task_data)
+                            debug_log(f"✓ Created {len(segments)} recovery event(s) for final gap")
                         else:
-                            debug_log(f"No afk activity in final gap, skipping backfill")
+                            debug_log(f"No online periods in final gap (system was offline)")
         except Exception as e:
             debug_log(f"✗ Exception during backfill: {type(e).__name__}: {e}")
     else:
