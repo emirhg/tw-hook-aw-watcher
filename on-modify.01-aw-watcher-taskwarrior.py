@@ -216,10 +216,11 @@ def heartbeat_daemon():
     listener.start()
 
     # Try to create ActivityWatch client with unique app name to avoid singleton conflicts
+    # Use PID-based name first to guarantee uniqueness and avoid conflicts
     client = None
     client_names = [
-        "aw-watcher-taskwarrior",
         f"aw-watcher-taskwarrior-{os.getpid()}",
+        "aw-watcher-taskwarrior",
         "aw-watcher-taskwarrior-recovery",
     ]
 
