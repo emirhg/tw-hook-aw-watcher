@@ -42,11 +42,11 @@ SOCKET_FILE = "/tmp/aw-watcher-taskwarrior.sock"
 DEBUG_LOG_FILE = "/tmp/aw-watcher-taskwarrior-debug.log"
 
 # Daemon settings
-HEARTBEAT_FREQUENCY = 3  # seconds
-PULSETIME = HEARTBEAT_FREQUENCY + 2  # Must be > HEARTBEAT_FREQUENCY
+HEARTBEAT_FREQUENCY = 15  # seconds
+PULSETIME = HEARTBEAT_FREQUENCY * 8  # Must be > HEARTBEAT_FREQUENCY
 COMMIT_INTERVAL = 15  # seconds
 SERVER_RETRY_INTERVAL = 30  # seconds
-OFFLINE_DETECTION_THRESHOLD = HEARTBEAT_FREQUENCY * 2  # seconds
+OFFLINE_DETECTION_THRESHOLD = HEARTBEAT_FREQUENCY * 20  # seconds
 
 # Socket protocol
 SOCKET_RECV_TIMEOUT = 2
@@ -184,7 +184,9 @@ def socket_listener(sock, task_state, stop_event):
                     debug_log(f"Ignoring update for {uuid}, tracking {task_state.uuid}")
             elif action == ACTION_STATUS:
                 try:
-                    conn.sendall((json.dumps({"uuid": task_state.uuid}) + "\n").encode())
+                    conn.sendall(
+                        (json.dumps({"uuid": task_state.uuid}) + "\n").encode()
+                    )
                 except OSError:
                     pass
             else:
@@ -255,7 +257,9 @@ def heartbeat_daemon():
                 stop_event.wait(SERVER_RETRY_INTERVAL)
 
         if stop_event.is_set():
-            debug_log("Stop received during bucket setup, exiting before first heartbeat")
+            debug_log(
+                "Stop received during bucket setup, exiting before first heartbeat"
+            )
             return
 
         last_heartbeat_time = datetime.now(timezone.utc)
@@ -269,7 +273,11 @@ def heartbeat_daemon():
 
                     if "OFFLINE" in task_tags:
                         offline_event_created = check_and_create_offline_events(
-                            client, bucket_id, last_heartbeat_time, now, payload_task_data
+                            client,
+                            bucket_id,
+                            last_heartbeat_time,
+                            now,
+                            payload_task_data,
                         )
                         if offline_event_created:
                             last_heartbeat_time = now
@@ -287,6 +295,7 @@ def heartbeat_daemon():
         except Exception as e:
             debug_log(f"✗ Error in daemon heartbeat loop: {type(e).__name__}: {e}")
             import traceback
+
             debug_log(f"Traceback: {traceback.format_exc()}")
     finally:
         cleanup_socket(sock)
@@ -325,8 +334,13 @@ def query_daemon_uuid():
         if not line:
             return None
         return json.loads(line).get("uuid")
-    except (ConnectionRefusedError, FileNotFoundError, socket.timeout,
-            OSError, json.JSONDecodeError) as e:
+    except (
+        ConnectionRefusedError,
+        FileNotFoundError,
+        socket.timeout,
+        OSError,
+        json.JSONDecodeError,
+    ) as e:
         debug_log(f"query_daemon_uuid failed: {e}")
         return None
 
@@ -355,7 +369,9 @@ def send_stop_signal(task_uuid):
         return
     try:
         with s:
-            s.sendall((json.dumps({"action": ACTION_STOP, "uuid": task_uuid}) + "\n").encode())
+            s.sendall(
+                (json.dumps({"action": ACTION_STOP, "uuid": task_uuid}) + "\n").encode()
+            )
     except OSError as e:
         debug_log(f"Error sending stop signal: {e}")
 
@@ -406,13 +422,17 @@ def get_last_tracked_event_end(client, bucket_id, task_uuid, since):
         events = client.get_events(bucket_id, start=since, end=now, limit=-1)
 
         if not events:
-            debug_log(f"No events found for task {task_uuid} since {since}, using task start as baseline")
+            debug_log(
+                f"No events found for task {task_uuid} since {since}, using task start as baseline"
+            )
             return since
 
         # Filter to events from this task (defend against stale events from previous tasks)
         matching_events = [e for e in events if e.data.get("uuid") == task_uuid]
         if not matching_events:
-            debug_log(f"No events found for task {task_uuid} in bucket {bucket_id}, using task start as baseline")
+            debug_log(
+                f"No events found for task {task_uuid} in bucket {bucket_id}, using task start as baseline"
+            )
             return since
 
         # Find the latest event end (duration is already a timedelta)
@@ -421,7 +441,9 @@ def get_last_tracked_event_end(client, bucket_id, task_uuid, since):
         debug_log(f"Last tracked event for {task_uuid} ended at {last_event_end}")
         return last_event_end
     except Exception as e:
-        debug_log(f"Error querying last tracked event: {type(e).__name__}: {e}, using task start as baseline")
+        debug_log(
+            f"Error querying last tracked event: {type(e).__name__}: {e}, using task start as baseline"
+        )
         return since
 
 
@@ -444,7 +466,9 @@ def get_active_task():
         return None
 
 
-def _create_offline_event(client, bucket_id, start_time: datetime, end_time: datetime, payload_task_data):
+def _create_offline_event(
+    client, bucket_id, start_time: datetime, end_time: datetime, payload_task_data
+):
     """
     POST an offline event to ActivityWatch, covering the gap from start_time to end_time.
 
@@ -469,11 +493,15 @@ def _create_offline_event(client, bucket_id, start_time: datetime, end_time: dat
                 debug_log(f"✓ Offline event posted successfully")
                 return True
             else:
-                debug_log(f"Event POST attempt {attempt+1}/3 failed: {response.status_code}")
+                debug_log(
+                    f"Event POST attempt {attempt + 1}/3 failed: {response.status_code}"
+                )
         except Exception as e:
-            debug_log(f"Event POST attempt {attempt+1}/3 failed: {type(e).__name__}: {e}")
+            debug_log(
+                f"Event POST attempt {attempt + 1}/3 failed: {type(e).__name__}: {e}"
+            )
         if attempt < 2:
-            backoff = min(HEARTBEAT_FREQUENCY * (2 ** attempt), 5)
+            backoff = min(HEARTBEAT_FREQUENCY * (2**attempt), 5)
             time.sleep(backoff)
     return False
 
@@ -496,7 +524,9 @@ def _get_online_segments(client, start_time: datetime, end_time: datetime):
         )
 
         if not afk_events:
-            debug_log(f"No afk events [{start_time} to {end_time}]: system was completely offline")
+            debug_log(
+                f"No afk events [{start_time} to {end_time}]: system was completely offline"
+            )
             return []
 
         # Sort events by timestamp
@@ -520,7 +550,9 @@ def _get_online_segments(client, start_time: datetime, end_time: datetime):
                 if gap > OFFLINE_DETECTION_THRESHOLD:
                     # Gap detected - close current segment and start a new one
                     segments.append((segment_start, segment_end))
-                    debug_log(f"Online segment: {segment_start} to {segment_end} ({(segment_end - segment_start).total_seconds():.0f}s)")
+                    debug_log(
+                        f"Online segment: {segment_start} to {segment_end} ({(segment_end - segment_start).total_seconds():.0f}s)"
+                    )
                     segment_start = event_start
                     segment_end = event_end
                 else:
@@ -530,7 +562,9 @@ def _get_online_segments(client, start_time: datetime, end_time: datetime):
         # Add the final segment
         if segment_start is not None and segment_end is not None:
             segments.append((segment_start, segment_end))
-            debug_log(f"Online segment: {segment_start} to {segment_end} ({(segment_end - segment_start).total_seconds():.0f}s)")
+            debug_log(
+                f"Online segment: {segment_start} to {segment_end} ({(segment_end - segment_start).total_seconds():.0f}s)"
+            )
 
         return segments
     except Exception as e:
@@ -564,9 +598,7 @@ def recover_daemon():
     task_desc = active_task.get("description", "unknown")
     is_offline = "OFFLINE" in active_task.get("tags", [])
 
-    debug_log(
-        f"Found active task: {task_desc} (OFFLINE: {is_offline})"
-    )
+    debug_log(f"Found active task: {task_desc} (OFFLINE: {is_offline})")
 
     # Check if daemon is already running
     if is_daemon_running():
@@ -577,7 +609,9 @@ def recover_daemon():
     tw_start = active_task.get("start")
     task_start_time = parse_tw_timestamp(tw_start) if tw_start else None
     if not task_start_time:
-        debug_log(f"Could not parse task start time ({tw_start}), skipping gap computation")
+        debug_log(
+            f"Could not parse task start time ({tw_start}), skipping gap computation"
+        )
         last_event_end = None
     else:
         debug_log(f"Task started at {task_start_time}")
@@ -590,12 +624,18 @@ def recover_daemon():
             try:
                 with client:
                     client.create_bucket(bucket_id, event_type="task-activity")
-                    last_event_end = get_last_tracked_event_end(client, bucket_id, task_uuid, task_start_time)
+                    last_event_end = get_last_tracked_event_end(
+                        client, bucket_id, task_uuid, task_start_time
+                    )
             except Exception as e:
-                debug_log(f"Could not query bucket: {type(e).__name__}: {e}, using task start as baseline")
+                debug_log(
+                    f"Could not query bucket: {type(e).__name__}: {e}, using task start as baseline"
+                )
                 last_event_end = task_start_time
         except Exception as e:
-            debug_log(f"Could not create ActivityWatch client: {type(e).__name__}: {e}, using task start as baseline")
+            debug_log(
+                f"Could not create ActivityWatch client: {type(e).__name__}: {e}, using task start as baseline"
+            )
             last_event_end = task_start_time
 
     # Backfill gaps BEFORE starting daemon to avoid heartbeat race conditions
@@ -607,8 +647,12 @@ def recover_daemon():
         # Check gap from last event to now
         gap_to_now = (now - last_event_end).total_seconds()
 
-        debug_log(f"Timeline: task started at {task_start_time}, last event ended at {last_event_end}, now {now}")
-        debug_log(f"Gaps: {gap_from_start:.1f}s (start→first event) + {gap_to_now:.1f}s (last event→now)")
+        debug_log(
+            f"Timeline: task started at {task_start_time}, last event ended at {last_event_end}, now {now}"
+        )
+        debug_log(
+            f"Gaps: {gap_from_start:.1f}s (start→first event) + {gap_to_now:.1f}s (last event→now)"
+        )
 
         bucket_id = f"aw-watcher-taskwarrior_{gethostname()}"
         payload_task_data = {
@@ -627,51 +671,100 @@ def recover_daemon():
 
                     # Backfill initial gap
                     if gap_from_start > OFFLINE_DETECTION_THRESHOLD:
-                        debug_log(f"Creating offline event for initial gap: {gap_from_start:.1f}s from {task_start_time} to {last_event_end}")
-                        _create_offline_event(client, bucket_id, task_start_time, last_event_end, payload_task_data)
+                        debug_log(
+                            f"Creating offline event for initial gap: {gap_from_start:.1f}s from {task_start_time} to {last_event_end}"
+                        )
+                        _create_offline_event(
+                            client,
+                            bucket_id,
+                            task_start_time,
+                            last_event_end,
+                            payload_task_data,
+                        )
                         debug_log(f"✓ Created offline event for initial gap")
 
                     # Backfill final gap
                     if gap_to_now > OFFLINE_DETECTION_THRESHOLD:
-                        debug_log(f"Creating offline event for final gap: {gap_to_now:.1f}s from {last_event_end} to {now}")
-                        _create_offline_event(client, bucket_id, last_event_end, now, payload_task_data)
+                        debug_log(
+                            f"Creating offline event for final gap: {gap_to_now:.1f}s from {last_event_end} to {now}"
+                        )
+                        _create_offline_event(
+                            client, bucket_id, last_event_end, now, payload_task_data
+                        )
                         debug_log(f"✓ Created offline event for final gap")
 
-                    if gap_from_start <= OFFLINE_DETECTION_THRESHOLD and gap_to_now <= OFFLINE_DETECTION_THRESHOLD:
-                        debug_log(f"Task is OFFLINE but gaps ({gap_from_start:.1f}s + {gap_to_now:.1f}s) are within threshold, no backfill needed")
+                    if (
+                        gap_from_start <= OFFLINE_DETECTION_THRESHOLD
+                        and gap_to_now <= OFFLINE_DETECTION_THRESHOLD
+                    ):
+                        debug_log(
+                            f"Task is OFFLINE but gaps ({gap_from_start:.1f}s + {gap_to_now:.1f}s) are within threshold, no backfill needed"
+                        )
                 else:
                     # ONLINE: backfill only continuous online periods (where afk events exist)
                     debug_log(f"Task is ONLINE, extracting online time segments")
 
                     # Check initial gap
                     if gap_from_start > OFFLINE_DETECTION_THRESHOLD:
-                        debug_log(f"Initial gap: {gap_from_start:.1f}s from {task_start_time} to {last_event_end}")
-                        segments = _get_online_segments(client, task_start_time, last_event_end)
+                        debug_log(
+                            f"Initial gap: {gap_from_start:.1f}s from {task_start_time} to {last_event_end}"
+                        )
+                        segments = _get_online_segments(
+                            client, task_start_time, last_event_end
+                        )
                         if segments:
                             for seg_start, seg_end in segments:
                                 duration_s = (seg_end - seg_start).total_seconds()
-                                debug_log(f"Creating recovery event for online segment: {duration_s:.1f}s")
-                                _create_offline_event(client, bucket_id, seg_start, seg_end, payload_task_data)
-                            debug_log(f"✓ Created {len(segments)} recovery event(s) for initial gap")
+                                debug_log(
+                                    f"Creating recovery event for online segment: {duration_s:.1f}s"
+                                )
+                                _create_offline_event(
+                                    client,
+                                    bucket_id,
+                                    seg_start,
+                                    seg_end,
+                                    payload_task_data,
+                                )
+                            debug_log(
+                                f"✓ Created {len(segments)} recovery event(s) for initial gap"
+                            )
                         else:
-                            debug_log(f"No online periods in initial gap (system was offline)")
+                            debug_log(
+                                f"No online periods in initial gap (system was offline)"
+                            )
 
                     # Check final gap
                     if gap_to_now > OFFLINE_DETECTION_THRESHOLD:
-                        debug_log(f"Final gap: {gap_to_now:.1f}s from {last_event_end} to {now}")
+                        debug_log(
+                            f"Final gap: {gap_to_now:.1f}s from {last_event_end} to {now}"
+                        )
                         segments = _get_online_segments(client, last_event_end, now)
                         if segments:
                             for seg_start, seg_end in segments:
                                 duration_s = (seg_end - seg_start).total_seconds()
-                                debug_log(f"Creating recovery event for online segment: {duration_s:.1f}s")
-                                _create_offline_event(client, bucket_id, seg_start, seg_end, payload_task_data)
-                            debug_log(f"✓ Created {len(segments)} recovery event(s) for final gap")
+                                debug_log(
+                                    f"Creating recovery event for online segment: {duration_s:.1f}s"
+                                )
+                                _create_offline_event(
+                                    client,
+                                    bucket_id,
+                                    seg_start,
+                                    seg_end,
+                                    payload_task_data,
+                                )
+                            debug_log(
+                                f"✓ Created {len(segments)} recovery event(s) for final gap"
+                            )
                         else:
-                            debug_log(f"No online periods in final gap (system was offline)")
+                            debug_log(
+                                f"No online periods in final gap (system was offline)"
+                            )
         except Exception as e:
             debug_log(f"✗ Exception during backfill: {type(e).__name__}: {e}")
     else:
-        debug_log("Could not determine task start or event end, resuming without backfill")
+        debug_log(
+            "Could not determine task start or event end, resuming without backfill"
+        )
 
     # Now start daemon after backfill is complete
     debug_log(f"Starting daemon for task {task_uuid}")
@@ -696,7 +789,9 @@ def recover_daemon():
         if is_daemon_running():
             debug_log("Daemon is actually running despite timeout, recovery succeeded")
             return True
-        debug_log("Failed to start daemon during recovery (socket binding timeout after 5s)")
+        debug_log(
+            "Failed to start daemon during recovery (socket binding timeout after 5s)"
+        )
         return False
 
     debug_log("=== Recovery completed ===")
@@ -740,7 +835,7 @@ def send_heartbeat_with_retry(client, bucket_id, heartbeat_event, max_retries=3)
             return True
         except Exception as e:
             if attempt < max_retries - 1:
-                backoff = min(HEARTBEAT_FREQUENCY * (2 ** attempt), 5)
+                backoff = min(HEARTBEAT_FREQUENCY * (2**attempt), 5)
                 debug_log(
                     f"Heartbeat failed (attempt {attempt + 1}/{max_retries}): {type(e).__name__}: {e}. "
                     f"Retrying in {backoff:.1f}s"
@@ -814,7 +909,7 @@ def check_and_create_offline_events(
                         )
                         return True
                     elif attempt < 2:
-                        backoff = min(HEARTBEAT_FREQUENCY * (2 ** attempt), 5)
+                        backoff = min(HEARTBEAT_FREQUENCY * (2**attempt), 5)
                         debug_log(
                             f"✗ HTTP {response.status_code}, retrying in {backoff:.1f}s"
                         )
@@ -825,7 +920,7 @@ def check_and_create_offline_events(
                         )
                 except Exception as insert_err:
                     if attempt < 2:
-                        backoff = min(HEARTBEAT_FREQUENCY * (2 ** attempt), 5)
+                        backoff = min(HEARTBEAT_FREQUENCY * (2**attempt), 5)
                         debug_log(
                             f"✗ Exception during insert: {type(insert_err).__name__}: {insert_err}. "
                             f"Retrying in {backoff:.1f}s"
