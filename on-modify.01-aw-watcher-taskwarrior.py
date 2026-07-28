@@ -35,6 +35,8 @@ from requests import post
 from aw_client import ActivityWatchClient
 from aw_core.models import Event
 
+import recording_control
+
 # --- Constants ---
 # Unix domain socket used for daemon control
 SOCKET_FILE = "/tmp/aw-watcher-taskwarrior.sock"
@@ -987,14 +989,20 @@ if __name__ == "__main__":
                 debug_log(f"Switching daemon from {current_uuid} to {task_uuid}")
                 send_stop_signal(current_uuid)
                 wait_for_daemon_exit()
+                recording_control.stop_recording(current_uuid)
                 start_daemon(new_task)
 
             else:
                 start_daemon(new_task)
 
+            if recording_control.has_record_tag(new_task.get("tags", [])):
+                recording_control.start_recording(new_task)
+
         elif not is_active_after and is_active_before:
             # Case 2: task stopped, completed, or deleted while active.
             send_stop_signal(task_uuid)
+            if recording_control.has_record_tag(old_task.get("tags", [])):
+                recording_control.stop_recording(task_uuid)
 
         elif is_active_after and is_active_before:
             # Case 3: task modified while active (description/project/tags).
