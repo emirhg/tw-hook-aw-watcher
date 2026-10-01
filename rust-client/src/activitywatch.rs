@@ -72,26 +72,36 @@ impl AwTaskWatcherClient {
     }
 
     pub fn send_heartbeat(&self, task: &ActiveTask, pulsetime: f64) -> Result<(), String> {
-        // Build data map: title, project, tags, uuid
+        // Build data map: only include non-empty values
         let mut data = serde_json::Map::new();
-        data.insert("title".to_string(), Value::String(task.title.clone()));
-        data.insert("project".to_string(), Value::String(task.project.clone()));
-        data.insert(
-            "tags".to_string(),
-            Value::Array(
-                task.tags
-                    .iter()
-                    .map(|t| Value::String(t.clone()))
-                    .collect(),
-            ),
-        );
-        data.insert(
-            "uuid".to_string(),
-            task.uuid
-                .as_ref()
-                .map(|u| Value::String(u.clone()))
-                .unwrap_or(Value::Null),
-        );
+
+        // Always include title if non-empty
+        if !task.title.is_empty() {
+            data.insert("title".to_string(), Value::String(task.title.clone()));
+        }
+
+        // Include project only if non-empty
+        if !task.project.is_empty() {
+            data.insert("project".to_string(), Value::String(task.project.clone()));
+        }
+
+        // Include tags only if non-empty
+        if !task.tags.is_empty() {
+            data.insert(
+                "tags".to_string(),
+                Value::Array(
+                    task.tags
+                        .iter()
+                        .map(|t| Value::String(t.clone()))
+                        .collect(),
+                ),
+            );
+        }
+
+        // Include uuid only if present
+        if let Some(uuid) = &task.uuid {
+            data.insert("uuid".to_string(), Value::String(uuid.clone()));
+        }
 
         let event = Event {
             id: None,
