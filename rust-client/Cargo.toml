@@ -1,0 +1,24 @@
+[package]
+name = "aw-taskwarrior"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "aw-taskwarrior"
+path = "src/main.rs"
+
+[dependencies]
+aw-client-rust = { git = "https://github.com/ActivityWatch/aw-server-rust", rev = "2875df5" }
+aw-models = { git = "https://github.com/ActivityWatch/aw-server-rust", rev = "2875df5" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+dirs = "5"
+ctrlc = "3"
+chrono = { version = "0.4", features = ["serde"] }
+gethostname = "0.4"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
